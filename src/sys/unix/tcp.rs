@@ -4,13 +4,13 @@ use std::net::{self, SocketAddr};
 use std::os::unix::io::{RawFd, FromRawFd, IntoRawFd, AsRawFd};
 use std::time::Duration;
 
-use libc;
 use net2::TcpStreamExt;
-use iovec::IoVec;
+use iovec::{IoVec, IoVecMut};
 
 use {io, Ready, Poll, PollOpt, Token};
 use event::Evented;
 
+use sgx_libc as libc;
 use sys::unix::eventedfd::EventedFd;
 use sys::unix::io::set_nonblock;
 use sys::unix::uio::VecIo;
@@ -128,11 +128,11 @@ impl TcpStream {
         self.inner.peek(buf)
     }
 
-    pub fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize> {
+    pub fn readv(&self, bufs: &mut [IoVecMut]) -> io::Result<usize> {
         self.inner.readv(bufs)
     }
 
-    pub fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize> {
+    pub fn writev(&self, bufs: &[IoVec]) -> io::Result<usize> {
         self.inner.writev(bufs)
     }
 }

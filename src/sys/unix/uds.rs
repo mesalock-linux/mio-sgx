@@ -77,14 +77,14 @@ impl UnixSocket {
         unsafe {
             if cfg!(target_os = "linux") {
                 let flags = libc::SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
-                match cvt(libc::socket(libc::AF_UNIX, flags, 0)) {
+                match cvt(libc::ocall::socket(libc::AF_UNIX, flags, 0)) {
                     Ok(fd) => return Ok(UnixSocket::from_raw_fd(fd)),
                     Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {}
                     Err(e) => return Err(e),
                 }
             }
 
-            let fd = cvt(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0))?;
+            let fd = cvt(libc::ocall::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0))?;
             let fd = UnixSocket::from_raw_fd(fd);
             set_cloexec(fd.as_raw_fd())?;
             set_nonblock(fd.as_raw_fd())?;
@@ -96,7 +96,7 @@ impl UnixSocket {
     pub fn connect<P: AsRef<Path> + ?Sized>(&self, addr: &P) -> io::Result<()> {
         unsafe {
             let (addr, len) = sockaddr_un(addr.as_ref())?;
-            cvt(libc::connect(self.as_raw_fd(),
+            cvt(libc::ocall::connect(self.as_raw_fd(),
                                    &addr as *const _ as *const _,
                                    len))?;
             Ok(())
@@ -106,14 +106,14 @@ impl UnixSocket {
     /// Listen for incoming requests
     pub fn listen(&self, backlog: usize) -> io::Result<()> {
         unsafe {
-            cvt(libc::listen(self.as_raw_fd(), backlog as i32))?;
+            cvt(libc::ocall::listen(self.as_raw_fd(), backlog as i32))?;
             Ok(())
         }
     }
 
     pub fn accept(&self) -> io::Result<UnixSocket> {
         unsafe {
-            let fd = cvt(libc::accept(self.as_raw_fd(),
+            let fd = cvt(libc::ocall::accept(self.as_raw_fd(),
                                            ptr::null_mut(),
                                            ptr::null_mut()))?;
             let fd = Io::from_raw_fd(fd);
@@ -127,7 +127,7 @@ impl UnixSocket {
     pub fn bind<P: AsRef<Path> + ?Sized>(&self, addr: &P) -> io::Result<()> {
         unsafe {
             let (addr, len) = sockaddr_un(addr.as_ref())?;
-            cvt(libc::bind(self.as_raw_fd(),
+            cvt(libc::ocall::bind(self.as_raw_fd(),
                                 &addr as *const _ as *const _,
                                 len))?;
             Ok(())
@@ -145,7 +145,7 @@ impl UnixSocket {
             Shutdown::Both => libc::SHUT_RDWR,
         };
         unsafe {
-            cvt(libc::shutdown(self.as_raw_fd(), how))?;
+            cvt(libc::ocall::shutdown(self.as_raw_fd(), how))?;
             Ok(())
         }
     }
@@ -166,7 +166,7 @@ impl UnixSocket {
             msg.msg_iovlen = 1;
             msg.msg_control = &mut cmsg as *mut _ as *mut _;
             msg.msg_controllen = mem::size_of_val(&cmsg).my_into();
-            let bytes = cvt(libc::recvmsg(self.as_raw_fd(), &mut msg, 0))?;
+            let bytes = cvt(libc::ocall::recvmsg(self.as_raw_fd(), &mut msg, 0))?;
 
             const SCM_RIGHTS: libc::c_int = 1;
 
@@ -200,7 +200,7 @@ impl UnixSocket {
             msg.msg_iovlen = 1;
             msg.msg_control = &mut cmsg as *mut _ as *mut _;
             msg.msg_controllen = mem::size_of_val(&cmsg).my_into();
-            let bytes = cvt(libc::sendmsg(self.as_raw_fd(), &msg, 0))?;
+            let bytes = cvt(libc::ocall::sendmsg(self.as_raw_fd(), &msg, 0))?;
             Ok(bytes as usize)
         }
     }
