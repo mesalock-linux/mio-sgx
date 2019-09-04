@@ -1,23 +1,23 @@
 use std::cmp;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use libc;
-use iovec::IoVec;
+use sgx_libc as libc;
+use iovec::{IoVec, IoVecMut};
 use iovec::unix as iovec;
 
 pub trait VecIo {
-    fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize>;
+    fn readv(&self, bufs: &mut [IoVecMut]) -> io::Result<usize>;
 
-    fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize>;
+    fn writev(&self, bufs: &[IoVec]) -> io::Result<usize>;
 }
 
 impl<T: AsRawFd> VecIo for T {
-    fn readv(&self, bufs: &mut [&mut IoVec]) -> io::Result<usize> {
+    fn readv(&self, bufs: &mut [IoVecMut]) -> io::Result<usize> {
         unsafe {
             let slice = iovec::as_os_slice_mut(bufs);
             let len = cmp::min(<libc::c_int>::max_value() as usize, slice.len());
-            let rc = libc::readv(self.as_raw_fd(),
-                                 slice.as_ptr(),
+            let rc = libc::ocall::readv(self.as_raw_fd(),
+                                 slice.as_ptr() as _,
                                  len as libc::c_int);
             if rc < 0 {
                 Err(io::Error::last_os_error())
@@ -27,12 +27,12 @@ impl<T: AsRawFd> VecIo for T {
         }
     }
 
-    fn writev(&self, bufs: &[&IoVec]) -> io::Result<usize> {
+    fn writev(&self, bufs: &[IoVec]) -> io::Result<usize> {
         unsafe {
             let slice = iovec::as_os_slice(bufs);
             let len = cmp::min(<libc::c_int>::max_value() as usize, slice.len());
-            let rc = libc::writev(self.as_raw_fd(),
-                                  slice.as_ptr(),
+            let rc = libc::ocall::writev(self.as_raw_fd(),
+                                  slice.as_ptr() as _,
                                   len as libc::c_int);
             if rc < 0 {
                 Err(io::Error::last_os_error())
