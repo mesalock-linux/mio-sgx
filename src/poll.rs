@@ -1,3 +1,4 @@
+use std::prelude::v1::*;
 use {sys, Token};
 use event_imp::{self as event, Ready, Event, Evented, PollOpt};
 use std::{fmt, io, ptr, usize};
@@ -7,11 +8,11 @@ use std::{mem, ops, isize};
 use std::os::unix::io::AsRawFd;
 #[cfg(all(unix, not(target_os = "fuchsia")))]
 use std::os::unix::io::RawFd;
-use std::process;
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, SgxMutex, SgxCondvar};
 use std::sync::atomic::{AtomicUsize, AtomicPtr, AtomicBool};
 use std::sync::atomic::Ordering::{self, Acquire, Release, AcqRel, Relaxed, SeqCst};
 use std::time::{Duration, Instant};
+use std::untrusted::time::InstantEx;
 
 // Poll is backed by two readiness queues. The first is a system readiness queue
 // represented by `sys::Selector`. The system readiness queue handles events
@@ -338,10 +339,10 @@ pub struct Poll {
     lock_state: AtomicUsize,
 
     // Sequences concurrent calls to `Poll::poll`
-    lock: Mutex<()>,
+    lock: SgxMutex<()>,
 
     // Wakeup the next waiter
-    condvar: Condvar,
+    condvar: SgxCondvar,
 }
 
 /// Handle to a user space `Poll` registration.
@@ -657,8 +658,8 @@ impl Poll {
             selector: sys::Selector::new()?,
             readiness_queue: ReadinessQueue::new()?,
             lock_state: AtomicUsize::new(0),
-            lock: Mutex::new(()),
-            condvar: Condvar::new(),
+            lock: SgxMutex::new(()),
+            condvar: SgxCondvar::new(),
         };
 
         // Register the notification wakeup FD with the IO poller
@@ -2068,7 +2069,7 @@ impl Clone for RegistrationInner {
         // We abort because such a program is incredibly degenerate, and we
         // don't care to support it.
         if old_size & !MAX_REFCOUNT != 0 {
-            process::abort();
+            sgx_trts::trts::rsgx_abort();
         }
 
         RegistrationInner {
