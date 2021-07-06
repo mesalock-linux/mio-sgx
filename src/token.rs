@@ -5,10 +5,10 @@
 ///
 /// See [`Poll`] for more documentation on polling.
 ///
-/// [`event::Source`]: crate::event::Source
-/// [`Poll`]: crate::Poll
-/// [`Registry::register`]: crate::Registry::register
-/// [`Registry::reregister`]: crate::Registry::reregister
+/// [`event::Source`]: ./event/trait.Source.html
+/// [`Poll`]: struct.Poll.html
+/// [`Registry::register`]: struct.Registry.html#method.register
+/// [`Registry::reregister`]: struct.Registry.html#method.reregister
 ///
 /// # Example
 ///
@@ -17,10 +17,11 @@
 ///
 /// [`slab`]: https://crates.io/crates/slab
 ///
-/// ```
+#[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
-/// use mio::{Events, Interests, Poll, Token};
+/// use mio::{Events, Interest, Poll, Token};
 /// use mio::net::TcpListener;
 ///
 /// use std::thread;
@@ -44,10 +45,10 @@
 /// let mut poll = Poll::new()?;
 ///
 /// // Tcp listener
-/// let listener = TcpListener::bind("127.0.0.1:0".parse()?)?;
+/// let mut listener = TcpListener::bind("127.0.0.1:0".parse()?)?;
 ///
 /// // Register the listener
-/// poll.registry().register(&listener, LISTENER, Interests::READABLE)?;
+/// poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
 ///
 /// // Spawn a thread that will connect a bunch of sockets then close them
 /// let addr = listener.local_addr()?;
@@ -79,7 +80,7 @@
 ///                 // encountered.
 ///                 loop {
 ///                     match listener.accept() {
-///                         Ok((socket, _)) => {
+///                         Ok((mut socket, _)) => {
 ///                             // Shutdown the server
 ///                             if next_socket_index == MAX_SOCKETS {
 ///                                 return Ok(());
@@ -90,7 +91,7 @@
 ///                             next_socket_index += 1;
 ///
 ///                             // Register the new socket w/ poll
-///                             poll.registry().register(&socket, token, Interests::READABLE)?;
+///                             poll.registry().register(&mut socket, token, Interest::READABLE)?;
 ///
 ///                             // Store the socket
 ///                             sockets.insert(token, socket);
@@ -129,12 +130,6 @@
 /// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Token(pub usize);
-
-impl From<usize> for Token {
-    fn from(val: usize) -> Token {
-        Token(val)
-    }
-}
 
 impl From<Token> for usize {
     fn from(val: Token) -> usize {

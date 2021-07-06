@@ -1,4 +1,4 @@
-use crate::{poll, sys, Registry, Token};
+use crate::{sys, Registry, Token};
 
 use std::io;
 
@@ -7,19 +7,19 @@ use std::io;
 /// When created it will cause events with [`readable`] readiness and the
 /// provided `token` if [`wake`] is called, possibly from another thread.
 ///
-/// [`Poll`]: crate::Poll
-/// [`readable`]: crate::event::Event::is_readable
-/// [`wake`]: Waker::wake
+/// [`Poll`]: struct.Poll.html
+/// [`readable`]: ./event/struct.Event.html#method.is_readable
+/// [`wake`]: struct.Waker.html#method.wake
 ///
 /// # Notes
 ///
 /// `Waker` events are only guaranteed to be delivered while the `Waker` value
 /// is alive.
 ///
-/// Only a single `Waker` should active per [`Poll`], if multiple threads need
+/// Only a single `Waker` can be active per [`Poll`], if multiple threads need
 /// access to the `Waker` it can be shared via for example an `Arc`. What
 /// happens if multiple `Waker`s are registered with the same `Poll` is
-/// undefined.
+/// unspecified.
 ///
 /// # Implementation notes
 ///
@@ -34,7 +34,8 @@ use std::io;
 ///
 /// Wake a [`Poll`] instance from another thread.
 ///
-/// ```
+#[cfg_attr(feature = "os-poll", doc = "```")]
+#[cfg_attr(not(feature = "os-poll"), doc = "```ignore")]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::thread;
 /// use std::time::Duration;
@@ -63,8 +64,8 @@ use std::io;
 /// // On our current thread we'll poll for events, without a timeout.
 /// poll.poll(&mut events, None)?;
 ///
-/// // After about 500 milliseconds we should we awoken by the other thread we
-/// // started, getting a single event.
+/// // After about 500 milliseconds we should be awoken by the other thread and
+/// // get a single event.
 /// assert!(!events.is_empty());
 /// let waker_event = events.iter().next().unwrap();
 /// assert!(waker_event.is_readable());
@@ -81,12 +82,14 @@ pub struct Waker {
 impl Waker {
     /// Create a new `Waker`.
     pub fn new(registry: &Registry, token: Token) -> io::Result<Waker> {
-        sys::Waker::new(poll::selector(&registry), token).map(|inner| Waker { inner })
+        #[cfg(debug_assertions)]
+        registry.register_waker();
+        sys::Waker::new(registry.selector(), token).map(|inner| Waker { inner })
     }
 
     /// Wake up the [`Poll`] associated with this `Waker`.
     ///
-    /// [`Poll`]: crate::Poll
+    /// [`Poll`]: struct.Poll.html
     pub fn wake(&self) -> io::Result<()> {
         self.inner.wake()
     }

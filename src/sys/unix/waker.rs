@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod eventfd {
     use crate::sys::Selector;
-    use crate::{Interests, Token};
+    use crate::{Interest, Token};
 
     use std::fs::File;
     use std::io::{self, Read, Write};
@@ -25,7 +25,7 @@ mod eventfd {
                 // it's closed when dropped, e.g. when register below fails.
                 let file = unsafe { File::from_raw_fd(fd) };
                 selector
-                    .register(fd, token, Interests::READABLE)
+                    .register(fd, token, Interest::READABLE)
                     .map(|()| Waker { fd: file })
             })
         }
@@ -99,15 +99,15 @@ mod kqueue {
 pub use self::kqueue::Waker;
 
 #[cfg(any(
-    target_os = "bitrig",
     target_os = "dragonfly",
+    target_os = "illumos",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "solaris"
 ))]
 mod pipe {
     use crate::sys::unix::Selector;
-    use crate::{Interests, Token};
+    use crate::{Interest, Token};
 
     use std::fs::File;
     use std::io::{self, Read, Write};
@@ -132,11 +132,17 @@ mod pipe {
             let sender = unsafe { File::from_raw_fd(fds[1]) };
             let receiver = unsafe { File::from_raw_fd(fds[0]) };
             selector
-                .register(fds[0], token, Interests::READABLE)
+                .register(fds[0], token, Interest::READABLE)
                 .map(|()| Waker { sender, receiver })
         }
 
         pub fn wake(&self) -> io::Result<()> {
+            // The epoll emulation on some illumos systems currently requires
+            // the pipe buffer to be completely empty for an edge-triggered
+            // wakeup on the pipe read side.
+            #[cfg(target_os = "illumos")]
+            self.empty();
+
             match (&self.sender).write(&[1]) {
                 Ok(_) => Ok(()),
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -165,8 +171,8 @@ mod pipe {
 }
 
 #[cfg(any(
-    target_os = "bitrig",
     target_os = "dragonfly",
+    target_os = "illumos",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "solaris"

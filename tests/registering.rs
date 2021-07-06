@@ -1,16 +1,18 @@
+#![cfg(all(feature = "os-poll", feature = "net"))]
+
 use std::io::{self, Write};
 use std::thread::sleep;
 use std::time::Duration;
 
 use log::{debug, info, trace};
-
 #[cfg(debug_assertions)]
 use mio::net::UdpSocket;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interests, Poll, Registry, Token};
+use mio::{Events, Interest, Poll, Registry, Token};
 
 mod util;
-
+#[cfg(debug_assertions)]
+use util::assert_error;
 use util::{any_local_address, init};
 
 const SERVER: Token = Token(0);
@@ -47,7 +49,7 @@ impl TestHandler {
                 assert!(self.state == 0, "unexpected state {}", self.state);
                 self.state = 1;
                 registry
-                    .reregister(&self.client, CLIENT, Interests::WRITABLE)
+                    .reregister(&mut self.client, CLIENT, Interest::WRITABLE)
                     .unwrap();
             }
             _ => panic!("unexpected token"),
@@ -61,32 +63,32 @@ impl TestHandler {
         assert!(self.state == 1, "unexpected state {}", self.state);
 
         self.state = 2;
-        registry.deregister(&self.client).unwrap();
-        registry.deregister(&self.server).unwrap();
+        registry.deregister(&mut self.client).unwrap();
+        registry.deregister(&mut self.server).unwrap();
     }
 }
 
 #[test]
-pub fn test_register_deregister() {
+pub fn register_deregister() {
     init();
 
     debug!("Starting TEST_REGISTER_DEREGISTER");
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(1024);
 
-    let server = TcpListener::bind(any_local_address()).unwrap();
+    let mut server = TcpListener::bind(any_local_address()).unwrap();
     let addr = server.local_addr().unwrap();
 
     info!("register server socket");
     poll.registry()
-        .register(&server, SERVER, Interests::READABLE)
+        .register(&mut server, SERVER, Interest::READABLE)
         .unwrap();
 
-    let client = TcpStream::connect(addr).unwrap();
+    let mut client = TcpStream::connect(addr).unwrap();
 
     // Register client socket only as writable
     poll.registry()
-        .register(&client, CLIENT, Interests::READABLE)
+        .register(&mut client, CLIENT, Interest::READABLE)
         .unwrap();
 
     let mut handler = TestHandler::new(server, client);
@@ -112,30 +114,30 @@ pub fn test_register_deregister() {
 }
 
 #[test]
-pub fn test_reregister_different_without_poll() {
+pub fn reregister_different_interest_without_poll() {
     init();
 
     let mut events = Events::with_capacity(1024);
     let mut poll = Poll::new().unwrap();
 
     // Create the listener
-    let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
 
     // Register the listener with `Poll`
     poll.registry()
-        .register(&l, Token(0), Interests::READABLE)
+        .register(&mut l, Token(0), Interest::READABLE)
         .unwrap();
 
-    let s1 = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let mut s1 = TcpStream::connect(l.local_addr().unwrap()).unwrap();
     poll.registry()
-        .register(&s1, Token(2), Interests::READABLE)
+        .register(&mut s1, Token(2), Interest::READABLE)
         .unwrap();
 
     const TIMEOUT: Duration = Duration::from_millis(200);
     sleep(TIMEOUT);
 
     poll.registry()
-        .reregister(&l, Token(0), Interests::WRITABLE)
+        .reregister(&mut l, Token(0), Interest::WRITABLE)
         .unwrap();
 
     poll.poll(&mut events, Some(TIMEOUT)).unwrap();
@@ -144,19 +146,19 @@ pub fn test_reregister_different_without_poll() {
 
 #[test]
 #[cfg(debug_assertions)] // Check is only present when debug assertions are enabled.
-fn test_tcp_register_multiple_event_loops() {
+fn tcp_register_multiple_event_loops() {
     init();
 
-    let listener = TcpListener::bind(any_local_address()).unwrap();
+    let mut listener = TcpListener::bind(any_local_address()).unwrap();
     let addr = listener.local_addr().unwrap();
 
     let poll1 = Poll::new().unwrap();
     poll1
         .registry()
         .register(
-            &listener,
+            &mut listener,
             Token(0),
-            Interests::READABLE | Interests::WRITABLE,
+            Interest::READABLE | Interest::WRITABLE,
         )
         .unwrap();
 
@@ -164,100 +166,77 @@ fn test_tcp_register_multiple_event_loops() {
 
     // Try registering the same socket with the initial one
     let res = poll2.registry().register(
-        &listener,
+        &mut listener,
         Token(0),
-        Interests::READABLE | Interests::WRITABLE,
+        Interest::READABLE | Interest::WRITABLE,
     );
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
-
-    // Try cloning the socket and registering it again
-    let listener2 = listener.try_clone().unwrap();
-    let res = poll2.registry().register(
-        &listener2,
-        Token(0),
-        Interests::READABLE | Interests::WRITABLE,
-    );
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
+    assert_error(res, "I/O source already registered with a `Registry`");
 
     // Try the stream
-    let stream = TcpStream::connect(addr).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll1
         .registry()
-        .register(&stream, Token(1), Interests::READABLE | Interests::WRITABLE)
+        .register(
+            &mut stream,
+            Token(1),
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .unwrap();
 
-    let res =
-        poll2
-            .registry()
-            .register(&stream, Token(1), Interests::READABLE | Interests::WRITABLE);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
-
-    // Try cloning the socket and registering it again
-    let stream2 = stream.try_clone().unwrap();
     let res = poll2.registry().register(
-        &stream2,
+        &mut stream,
         Token(1),
-        Interests::READABLE | Interests::WRITABLE,
+        Interest::READABLE | Interest::WRITABLE,
     );
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
+    assert_error(res, "I/O source already registered with a `Registry`");
 }
 
 #[test]
 #[cfg(debug_assertions)] // Check is only present when debug assertions are enabled.
-fn test_udp_register_multiple_event_loops() {
+fn udp_register_multiple_event_loops() {
     init();
 
-    let socket = UdpSocket::bind(any_local_address()).unwrap();
+    let mut socket = UdpSocket::bind(any_local_address()).unwrap();
 
     let poll1 = Poll::new().unwrap();
     poll1
         .registry()
-        .register(&socket, Token(0), Interests::READABLE | Interests::WRITABLE)
+        .register(
+            &mut socket,
+            Token(0),
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .unwrap();
 
     let poll2 = Poll::new().unwrap();
 
     // Try registering the same socket with the initial one
-    let res =
-        poll2
-            .registry()
-            .register(&socket, Token(0), Interests::READABLE | Interests::WRITABLE);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
-
-    // Try cloning the socket and registering it again
-    let socket2 = socket.try_clone().unwrap();
     let res = poll2.registry().register(
-        &socket2,
+        &mut socket,
         Token(0),
-        Interests::READABLE | Interests::WRITABLE,
+        Interest::READABLE | Interest::WRITABLE,
     );
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Other);
+    assert_error(res, "I/O source already registered with a `Registry`");
 }
 
 #[test]
-fn test_registering_after_deregistering() {
+fn registering_after_deregistering() {
     init();
 
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(8);
 
-    let server = TcpListener::bind(any_local_address()).unwrap();
+    let mut server = TcpListener::bind(any_local_address()).unwrap();
 
     poll.registry()
-        .register(&server, SERVER, Interests::READABLE)
+        .register(&mut server, SERVER, Interest::READABLE)
         .unwrap();
 
-    poll.registry().deregister(&server).unwrap();
+    poll.registry().deregister(&mut server).unwrap();
 
     poll.registry()
-        .register(&server, SERVER, Interests::READABLE)
+        .register(&mut server, SERVER, Interest::READABLE)
         .unwrap();
 
     poll.poll(&mut events, Some(Duration::from_millis(100)))

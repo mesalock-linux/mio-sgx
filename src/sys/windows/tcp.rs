@@ -1,487 +1,349 @@
-use super::selector::SockState;
-use super::InternalState;
-use super::{inaddr_any, new_socket, socket_addr};
-use crate::poll;
-use crate::sys::windows::init;
-use crate::{event, Interests, Registry, Token};
+use std::convert::TryInto;
+use std::io;
+use std::mem::size_of;
+use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::windows::io::FromRawSocket;
+use std::os::windows::raw::SOCKET as StdSocket;
+use std::ptr;
+use std::time::Duration; // winapi uses usize, stdlib uses u32/u64.
 
-use std::fmt;
-use std::io::{self, IoSlice, IoSliceMut, Read, Write};
-use std::net::{self, SocketAddr};
-use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
-use std::os::windows::raw::SOCKET as StdSocket; // winapi uses usize, stdlib uses u32/u64.
-use std::sync::{Arc, Mutex};
-use winapi::um::winsock2::{bind, closesocket, connect, listen, SOCKET_ERROR, SOCK_STREAM};
+use winapi::ctypes::{c_char, c_int, c_ulong, c_ushort};
+use winapi::shared::mstcpip;
+use winapi::shared::ws2def::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_STORAGE};
+use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH;
 
-pub struct TcpStream {
-    internal: Arc<Mutex<Option<InternalState>>>,
-    inner: net::TcpStream,
+use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPDWORD, LPVOID, TRUE};
+use winapi::um::winsock2::{
+    self, closesocket, getsockname, getsockopt, linger, setsockopt, WSAIoctl, LPWSAOVERLAPPED,
+    PF_INET, PF_INET6, SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_KEEPALIVE, SO_LINGER,
+    SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF,
+};
+
+use crate::net::TcpKeepalive;
+use crate::sys::windows::net::{init, new_socket, socket_addr};
+
+pub(crate) type TcpSocket = SOCKET;
+
+pub(crate) fn new_v4_socket() -> io::Result<TcpSocket> {
+    init();
+    new_socket(PF_INET, SOCK_STREAM)
 }
 
-pub struct TcpListener {
-    internal: Arc<Mutex<Option<InternalState>>>,
-    inner: net::TcpListener,
+pub(crate) fn new_v6_socket() -> io::Result<TcpSocket> {
+    init();
+    new_socket(PF_INET6, SOCK_STREAM)
 }
 
-macro_rules! wouldblock {
-    ($self:ident, $method:ident)  => {{
-        let result = (&$self.inner).$method();
-        if let Err(ref e) = result {
-            if e.kind() == io::ErrorKind::WouldBlock {
-                let internal = $self.internal.lock().unwrap();
-                if internal.is_some() {
-                    let selector = internal.as_ref().unwrap().selector.clone();
-                    let token = internal.as_ref().unwrap().token;
-                    let interests = internal.as_ref().unwrap().interests;
-                    drop(internal);
-                    selector.reregister(
-                        $self,
-                        token,
-                        interests,
-                    )?;
-                }
+pub(crate) fn bind(socket: TcpSocket, addr: SocketAddr) -> io::Result<()> {
+    use winsock2::bind;
+
+    let (raw_addr, raw_addr_length) = socket_addr(&addr);
+    syscall!(
+        bind(socket, raw_addr.as_ptr(), raw_addr_length),
+        PartialEq::eq,
+        SOCKET_ERROR
+    )?;
+    Ok(())
+}
+
+pub(crate) fn connect(socket: TcpSocket, addr: SocketAddr) -> io::Result<net::TcpStream> {
+    use winsock2::connect;
+
+    let (raw_addr, raw_addr_length) = socket_addr(&addr);
+
+    let res = syscall!(
+        connect(socket, raw_addr.as_ptr(), raw_addr_length),
+        PartialEq::eq,
+        SOCKET_ERROR
+    );
+
+    match res {
+        Err(err) if err.kind() != io::ErrorKind::WouldBlock => Err(err),
+        _ => Ok(unsafe { net::TcpStream::from_raw_socket(socket as StdSocket) }),
+    }
+}
+
+pub(crate) fn listen(socket: TcpSocket, backlog: u32) -> io::Result<net::TcpListener> {
+    use std::convert::TryInto;
+    use winsock2::listen;
+
+    let backlog = backlog.try_into().unwrap_or(i32::max_value());
+    syscall!(listen(socket, backlog), PartialEq::eq, SOCKET_ERROR)?;
+    Ok(unsafe { net::TcpListener::from_raw_socket(socket as StdSocket) })
+}
+
+pub(crate) fn close(socket: TcpSocket) {
+    let _ = unsafe { closesocket(socket) };
+}
+
+pub(crate) fn set_reuseaddr(socket: TcpSocket, reuseaddr: bool) -> io::Result<()> {
+    let val: BOOL = if reuseaddr { TRUE } else { FALSE };
+
+    match unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &val as *const _ as *const c_char,
+            size_of::<BOOL>() as c_int,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn get_reuseaddr(socket: TcpSocket) -> io::Result<bool> {
+    let mut optval: c_char = 0;
+    let mut optlen = size_of::<BOOL>() as c_int;
+
+    match unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(optval != 0),
+    }
+}
+
+pub(crate) fn get_localaddr(socket: TcpSocket) -> io::Result<SocketAddr> {
+    let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&storage) as c_int;
+
+    match unsafe { getsockname(socket, &mut storage as *mut _ as *mut _, &mut length) } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => {
+            if storage.ss_family as c_int == AF_INET {
+                // Safety: if the ss_family field is AF_INET then storage must be a sockaddr_in.
+                let addr: &SOCKADDR_IN = unsafe { &*(&storage as *const _ as *const SOCKADDR_IN) };
+                let ip_bytes = unsafe { addr.sin_addr.S_un.S_un_b() };
+                let ip =
+                    Ipv4Addr::from([ip_bytes.s_b1, ip_bytes.s_b2, ip_bytes.s_b3, ip_bytes.s_b4]);
+                let port = u16::from_be(addr.sin_port);
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            } else if storage.ss_family as c_int == AF_INET6 {
+                // Safety: if the ss_family field is AF_INET6 then storage must be a sockaddr_in6.
+                let addr: &SOCKADDR_IN6_LH =
+                    unsafe { &*(&storage as *const _ as *const SOCKADDR_IN6_LH) };
+                let ip = Ipv6Addr::from(*unsafe { addr.sin6_addr.u.Byte() });
+                let port = u16::from_be(addr.sin6_port);
+                let scope_id = unsafe { *addr.u.sin6_scope_id() };
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    port,
+                    addr.sin6_flowinfo,
+                    scope_id,
+                )))
+            } else {
+                Err(std::io::ErrorKind::InvalidInput.into())
             }
         }
-        result
-    }};
-    ($self:ident, $method:ident, $($args:expr),* )  => {{
-        let result = (&$self.inner).$method($($args),*);
-        if let Err(ref e) = result {
-            if e.kind() == io::ErrorKind::WouldBlock {
-                let internal = $self.internal.lock().unwrap();
-                if internal.is_some() {
-                    let selector = internal.as_ref().unwrap().selector.clone();
-                    let token = internal.as_ref().unwrap().token;
-                    let interests = internal.as_ref().unwrap().interests;
-                    drop(internal);
-                    selector.reregister(
-                        $self,
-                        token,
-                        interests,
-                    )?;
-                }
+    }
+}
+
+pub(crate) fn set_linger(socket: TcpSocket, dur: Option<Duration>) -> io::Result<()> {
+    let val: linger = linger {
+        l_onoff: if dur.is_some() { 1 } else { 0 },
+        l_linger: dur.map(|dur| dur.as_secs() as c_ushort).unwrap_or_default(),
+    };
+
+    match unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_LINGER,
+            &val as *const _ as *const c_char,
+            size_of::<linger>() as c_int,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn get_linger(socket: TcpSocket) -> io::Result<Option<Duration>> {
+    let mut val: linger = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<linger>() as c_int;
+
+    match unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_LINGER,
+            &mut val as *mut _ as *mut _,
+            &mut len,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => {
+            if val.l_onoff == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(Duration::from_secs(val.l_linger as u64)))
             }
-        }
-        result
-    }};
-}
-
-impl TcpStream {
-    pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        init();
-        new_socket(addr, SOCK_STREAM)
-            .and_then(|socket| {
-                // Required for a future `connect_overlapped` operation to be
-                // executed successfully.
-                let any_addr = inaddr_any(addr);
-                let (raw_addr, raw_addr_length) = socket_addr(&any_addr);
-                syscall!(
-                    bind(socket, raw_addr, raw_addr_length),
-                    PartialEq::eq,
-                    SOCKET_ERROR
-                )
-                .and_then(|_| {
-                    let (raw_addr, raw_addr_length) = socket_addr(&addr);
-                    syscall!(
-                        connect(socket, raw_addr, raw_addr_length),
-                        PartialEq::eq,
-                        SOCKET_ERROR
-                    )
-                    .or_else(|err| match err {
-                        ref err if err.kind() == io::ErrorKind::WouldBlock => Ok(0),
-                        err => Err(err),
-                    })
-                })
-                .map(|_| socket)
-                .map_err(|err| {
-                    // Close the socket if we hit an error, ignoring the error
-                    // from closing since we can't pass back two errors.
-                    let _ = unsafe { closesocket(socket) };
-                    err
-                })
-            })
-            .map(|socket| TcpStream {
-                internal: Arc::new(Mutex::new(None)),
-                inner: unsafe { net::TcpStream::from_raw_socket(socket as StdSocket) },
-            })
-    }
-
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-
-    pub fn try_clone(&self) -> io::Result<TcpStream> {
-        self.inner.try_clone().map(|s| TcpStream {
-            internal: Arc::new(Mutex::new(None)),
-            inner: s,
-        })
-    }
-
-    pub fn shutdown(&self, how: net::Shutdown) -> io::Result<()> {
-        self.inner.shutdown(how)
-    }
-
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.inner.set_nodelay(nodelay)
-    }
-
-    pub fn nodelay(&self) -> io::Result<bool> {
-        self.inner.nodelay()
-    }
-
-    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-        self.inner.set_ttl(ttl)
-    }
-
-    pub fn ttl(&self) -> io::Result<u32> {
-        self.inner.ttl()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        self.inner.take_error()
-    }
-
-    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.peek(buf)
-    }
-}
-
-impl super::SocketState for TcpStream {
-    fn get_sock_state(&self) -> Option<Arc<Mutex<SockState>>> {
-        let internal = self.internal.lock().unwrap();
-        match &*internal {
-            Some(internal) => match &internal.sock_state {
-                Some(arc) => Some(arc.clone()),
-                None => None,
-            },
-            None => None,
-        }
-    }
-    fn set_sock_state(&self, sock_state: Option<Arc<Mutex<SockState>>>) {
-        let mut internal = self.internal.lock().unwrap();
-        match &mut *internal {
-            Some(internal) => {
-                internal.sock_state = sock_state;
-            }
-            None => {}
-        };
-    }
-}
-
-impl<'a> super::SocketState for &'a TcpStream {
-    fn get_sock_state(&self) -> Option<Arc<Mutex<SockState>>> {
-        let internal = self.internal.lock().unwrap();
-        match &*internal {
-            Some(internal) => match &internal.sock_state {
-                Some(arc) => Some(arc.clone()),
-                None => None,
-            },
-            None => None,
-        }
-    }
-    fn set_sock_state(&self, sock_state: Option<Arc<Mutex<SockState>>>) {
-        let mut internal = self.internal.lock().unwrap();
-        match &mut *internal {
-            Some(internal) => {
-                internal.sock_state = sock_state;
-            }
-            None => {}
-        };
-    }
-}
-
-impl Read for TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        wouldblock!(self, read, buf)
-    }
-
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        wouldblock!(self, read_vectored, bufs)
-    }
-}
-
-impl<'a> Read for &'a TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        wouldblock!(self, read, buf)
-    }
-
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        wouldblock!(self, read_vectored, bufs)
-    }
-}
-
-impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        wouldblock!(self, write, buf)
-    }
-
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        wouldblock!(self, write_vectored, bufs)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        wouldblock!(self, flush)
-    }
-}
-
-impl<'a> Write for &'a TcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        wouldblock!(self, write, buf)
-    }
-
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        wouldblock!(self, write_vectored, bufs)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        wouldblock!(self, flush)
-    }
-}
-
-impl event::Source for TcpStream {
-    fn register(&self, registry: &Registry, token: Token, interests: Interests) -> io::Result<()> {
-        {
-            let mut internal = self.internal.lock().unwrap();
-            if internal.is_none() {
-                *internal = Some(InternalState::new(
-                    poll::selector(registry).clone_inner(),
-                    token,
-                    interests,
-                ));
-            }
-        }
-        let result = poll::selector(registry).register(self, token, interests);
-        match result {
-            Ok(_) => {}
-            Err(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                *internal = None;
-            }
-        }
-        result
-    }
-
-    fn reregister(
-        &self,
-        registry: &Registry,
-        token: Token,
-        interests: Interests,
-    ) -> io::Result<()> {
-        let result = poll::selector(registry).reregister(self, token, interests);
-        match result {
-            Ok(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                internal.as_mut().unwrap().token = token;
-                internal.as_mut().unwrap().interests = interests;
-            }
-            Err(_) => {}
-        };
-        result
-    }
-
-    fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        let result = poll::selector(registry).deregister(self);
-        match result {
-            Ok(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                *internal = None;
-            }
-            Err(_) => {}
-        };
-        result
-    }
-}
-
-impl fmt::Debug for TcpStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, f)
-    }
-}
-
-impl FromRawSocket for TcpStream {
-    unsafe fn from_raw_socket(rawsocket: RawSocket) -> TcpStream {
-        TcpStream {
-            internal: Arc::new(Mutex::new(None)),
-            inner: net::TcpStream::from_raw_socket(rawsocket),
         }
     }
 }
 
-impl IntoRawSocket for TcpStream {
-    fn into_raw_socket(self) -> RawSocket {
-        self.inner.as_raw_socket()
+pub(crate) fn set_recv_buffer_size(socket: TcpSocket, size: u32) -> io::Result<()> {
+    let size = size.try_into().ok().unwrap_or_else(i32::max_value);
+    match unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &size as *const _ as *const c_char,
+            size_of::<c_int>() as c_int,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
     }
 }
 
-impl AsRawSocket for TcpStream {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.inner.as_raw_socket()
+pub(crate) fn get_recv_buffer_size(socket: TcpSocket) -> io::Result<u32> {
+    let mut optval: c_int = 0;
+    let mut optlen = size_of::<c_int>() as c_int;
+    match unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen as *mut _,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(optval as u32),
     }
 }
 
-impl TcpListener {
-    pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
-        init();
-        new_socket(addr, SOCK_STREAM).and_then(|socket| {
-            let (raw_addr, raw_addr_length) = socket_addr(&addr);
-            syscall!(
-                bind(socket, raw_addr, raw_addr_length,),
-                PartialEq::eq,
-                SOCKET_ERROR
-            )
-            .and_then(|_| syscall!(listen(socket, 1024), PartialEq::eq, SOCKET_ERROR))
-            .map_err(|err| {
-                // Close the socket if we hit an error, ignoring the error
-                // from closing since we can't pass back two errors.
-                let _ = unsafe { closesocket(socket) };
-                err
-            })
-            .map(|_| TcpListener {
-                internal: Arc::new(Mutex::new(None)),
-                inner: unsafe { net::TcpListener::from_raw_socket(socket as StdSocket) },
-            })
-        })
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-
-    pub fn try_clone(&self) -> io::Result<TcpListener> {
-        self.inner.try_clone().map(|s| TcpListener {
-            internal: Arc::new(Mutex::new(None)),
-            inner: s,
-        })
-    }
-
-    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        wouldblock!(self, accept).map(|(inner, addr)| {
-            (
-                TcpStream {
-                    internal: Arc::new(Mutex::new(None)),
-                    inner,
-                },
-                addr,
-            )
-        })
-    }
-
-    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-        self.inner.set_ttl(ttl)
-    }
-
-    pub fn ttl(&self) -> io::Result<u32> {
-        self.inner.ttl()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        self.inner.take_error()
+pub(crate) fn set_send_buffer_size(socket: TcpSocket, size: u32) -> io::Result<()> {
+    let size = size.try_into().ok().unwrap_or_else(i32::max_value);
+    match unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &size as *const _ as *const c_char,
+            size_of::<c_int>() as c_int,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
     }
 }
 
-impl super::SocketState for TcpListener {
-    fn get_sock_state(&self) -> Option<Arc<Mutex<SockState>>> {
-        let internal = self.internal.lock().unwrap();
-        match &*internal {
-            Some(internal) => match &internal.sock_state {
-                Some(arc) => Some(arc.clone()),
-                None => None,
-            },
-            None => None,
-        }
-    }
-    fn set_sock_state(&self, sock_state: Option<Arc<Mutex<SockState>>>) {
-        let mut internal = self.internal.lock().unwrap();
-        match &mut *internal {
-            Some(internal) => {
-                internal.sock_state = sock_state;
-            }
-            None => {}
-        };
+pub(crate) fn get_send_buffer_size(socket: TcpSocket) -> io::Result<u32> {
+    let mut optval: c_int = 0;
+    let mut optlen = size_of::<c_int>() as c_int;
+    match unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen as *mut _,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(optval as u32),
     }
 }
 
-impl event::Source for TcpListener {
-    fn register(&self, registry: &Registry, token: Token, interests: Interests) -> io::Result<()> {
-        {
-            let mut internal = self.internal.lock().unwrap();
-            if internal.is_none() {
-                *internal = Some(InternalState::new(
-                    poll::selector(registry).clone_inner(),
-                    token,
-                    interests,
-                ));
-            }
-        }
-        let result = poll::selector(registry).register(self, token, interests);
-        match result {
-            Ok(_) => {}
-            Err(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                *internal = None;
-            }
-        }
-        result
-    }
-
-    fn reregister(
-        &self,
-        registry: &Registry,
-        token: Token,
-        interests: Interests,
-    ) -> io::Result<()> {
-        let result = poll::selector(registry).reregister(self, token, interests);
-        match result {
-            Ok(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                internal.as_mut().unwrap().token = token;
-                internal.as_mut().unwrap().interests = interests;
-            }
-            Err(_) => {}
-        };
-        result
-    }
-
-    fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        let result = poll::selector(registry).deregister(self);
-        match result {
-            Ok(_) => {
-                let mut internal = self.internal.lock().unwrap();
-                *internal = None;
-            }
-            Err(_) => {}
-        };
-        result
+pub(crate) fn set_keepalive(socket: TcpSocket, keepalive: bool) -> io::Result<()> {
+    let val: BOOL = if keepalive { TRUE } else { FALSE };
+    match unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &val as *const _ as *const c_char,
+            size_of::<BOOL>() as c_int,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
     }
 }
 
-impl fmt::Debug for TcpListener {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, f)
+pub(crate) fn get_keepalive(socket: TcpSocket) -> io::Result<bool> {
+    let mut optval: c_char = 0;
+    let mut optlen = size_of::<BOOL>() as c_int;
+
+    match unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen,
+        )
+    } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(optval != FALSE as c_char),
     }
 }
 
-impl FromRawSocket for TcpListener {
-    unsafe fn from_raw_socket(rawsocket: RawSocket) -> TcpListener {
-        TcpListener {
-            internal: Arc::new(Mutex::new(None)),
-            inner: net::TcpListener::from_raw_socket(rawsocket),
-        }
+pub(crate) fn set_keepalive_params(socket: TcpSocket, keepalive: TcpKeepalive) -> io::Result<()> {
+    /// Windows configures keepalive time/interval in a u32 of milliseconds.
+    fn dur_to_ulong_ms(dur: Duration) -> c_ulong {
+        dur.as_millis()
+            .try_into()
+            .ok()
+            .unwrap_or_else(u32::max_value)
+    }
+
+    // If any of the fields on the `tcp_keepalive` struct were not provided by
+    // the user, just leaving them zero will clobber any existing value.
+    // Unfortunately, we can't access the current value, so we will use the
+    // defaults if a value for the time or interval was not not provided.
+    let time = keepalive.time.unwrap_or_else(|| {
+        // The default value is two hours, as per
+        // https://docs.microsoft.com/en-us/windows/win32/winsock/sio-keepalive-vals
+        let two_hours = 2 * 60 * 60;
+        Duration::from_secs(two_hours)
+    });
+
+    let interval = keepalive.interval.unwrap_or_else(|| {
+        // The default value is one second, as per
+        // https://docs.microsoft.com/en-us/windows/win32/winsock/sio-keepalive-vals
+        Duration::from_secs(1)
+    });
+
+    let mut keepalive = mstcpip::tcp_keepalive {
+        // Enable keepalive
+        onoff: 1,
+        keepalivetime: dur_to_ulong_ms(time),
+        keepaliveinterval: dur_to_ulong_ms(interval),
+    };
+
+    let mut out = 0;
+    match unsafe {
+        WSAIoctl(
+            socket,
+            mstcpip::SIO_KEEPALIVE_VALS,
+            &mut keepalive as *mut _ as LPVOID,
+            size_of::<mstcpip::tcp_keepalive>() as DWORD,
+            ptr::null_mut() as LPVOID,
+            0 as DWORD,
+            &mut out as *mut _ as LPDWORD,
+            0 as LPWSAOVERLAPPED,
+            None,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
     }
 }
 
-impl IntoRawSocket for TcpListener {
-    fn into_raw_socket(self) -> RawSocket {
-        self.inner.as_raw_socket()
-    }
-}
-
-impl AsRawSocket for TcpListener {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.inner.as_raw_socket()
-    }
+pub(crate) fn accept(listener: &net::TcpListener) -> io::Result<(net::TcpStream, SocketAddr)> {
+    // The non-blocking state of `listener` is inherited. See
+    // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-accept#remarks.
+    listener.accept()
 }

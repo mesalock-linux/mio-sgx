@@ -1,7 +1,6 @@
-use crate::{Interests, Registry, Token};
+use crate::{Interest, Registry, Token};
 
 use std::io;
-use std::ops::Deref;
 
 /// An event source that may be registered with [`Registry`].
 ///
@@ -12,7 +11,7 @@ use std::ops::Deref;
 ///
 /// See [`Registry`] for more details.
 ///
-/// [`Registry`]: crate::Registry
+/// [`Registry`]: ../struct.Registry.html
 ///
 /// # Implementing `event::Source`
 ///
@@ -22,8 +21,8 @@ use std::ops::Deref;
 /// lower level handle. Examples of this are [`TcpStream`]s, or the *unix only*
 /// [`SourceFd`].
 ///
-/// [`TcpStream`]: crate::net::TcpStream
-/// [`SourceFd`]: crate::unix::SourceFd
+/// [`TcpStream`]: ../net/struct.TcpStream.html
+/// [`SourceFd`]: ../unix/struct.SourceFd.html
 ///
 /// # Dropping `event::Source`s
 ///
@@ -33,14 +32,15 @@ use std::ops::Deref;
 /// a `File` will close itself. However since deregistering needs access to
 /// [`Registry`] this cannot be done while being dropped.
 ///
-/// [deregistered]: crate::Registry::deregister
+/// [deregistered]: ../struct.Registry.html#method.deregister
 ///
 /// # Examples
 ///
 /// Implementing `Source` on a struct containing a socket:
 ///
-/// ```
-/// use mio::{Interests, Registry, Token};
+#[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
+/// use mio::{Interest, Registry, Token};
 /// use mio::event::Source;
 /// use mio::net::TcpStream;
 ///
@@ -52,21 +52,21 @@ use std::ops::Deref;
 /// }
 ///
 /// impl Source for MySource {
-///     fn register(&self, registry: &Registry, token: Token, interests: Interests)
+///     fn register(&mut self, registry: &Registry, token: Token, interests: Interest)
 ///         -> io::Result<()>
 ///     {
 ///         // Delegate the `register` call to `socket`
 ///         self.socket.register(registry, token, interests)
 ///     }
 ///
-///     fn reregister(&self, registry: &Registry, token: Token, interests: Interests)
+///     fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest)
 ///         -> io::Result<()>
 ///     {
 ///         // Delegate the `reregister` call to `socket`
 ///         self.socket.reregister(registry, token, interests)
 ///     }
 ///
-///     fn deregister(&self, registry: &Registry) -> io::Result<()> {
+///     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
 ///         // Delegate the `deregister` call to `socket`
 ///         self.socket.deregister(registry)
 ///     }
@@ -79,8 +79,13 @@ pub trait Source {
     /// instead. Implementors should handle registration by delegating the call
     /// to another `Source` type.
     ///
-    /// [`Registry::register`]: crate::Registry::register
-    fn register(&self, registry: &Registry, token: Token, interests: Interests) -> io::Result<()>;
+    /// [`Registry::register`]: ../struct.Registry.html#method.register
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()>;
 
     /// Re-register `self` with the given `Registry` instance.
     ///
@@ -88,9 +93,13 @@ pub trait Source {
     /// [`Registry::reregister`] instead. Implementors should handle
     /// re-registration by either delegating the call to another `Source` type.
     ///
-    /// [`Registry::reregister`]: crate::Registry::reregister
-    fn reregister(&self, registry: &Registry, token: Token, interests: Interests)
-        -> io::Result<()>;
+    /// [`Registry::reregister`]: ../struct.Registry.html#method.reregister
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()>;
 
     /// Deregister `self` from the given `Registry` instance.
     ///
@@ -98,29 +107,33 @@ pub trait Source {
     /// [`Registry::deregister`] instead. Implementors should handle
     /// deregistration by delegating the call to another `Source` type.
     ///
-    /// [`Registry::deregister`]: crate::Registry::deregister
-    fn deregister(&self, registry: &Registry) -> io::Result<()>;
+    /// [`Registry::deregister`]: ../struct.Registry.html#method.deregister
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()>;
 }
 
-impl<T, S> Source for T
+impl<T> Source for Box<T>
 where
-    T: Deref<Target = S>,
-    S: Source + ?Sized,
+    T: Source + ?Sized,
 {
-    fn register(&self, registry: &Registry, token: Token, interests: Interests) -> io::Result<()> {
-        self.deref().register(registry, token, interests)
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        (&mut **self).register(registry, token, interests)
     }
 
     fn reregister(
-        &self,
+        &mut self,
         registry: &Registry,
         token: Token,
-        interests: Interests,
+        interests: Interest,
     ) -> io::Result<()> {
-        self.deref().reregister(registry, token, interests)
+        (&mut **self).reregister(registry, token, interests)
     }
 
-    fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        self.deref().deregister(registry)
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        (&mut **self).deregister(registry)
     }
 }

@@ -1,11 +1,10 @@
-use crate::sys::Events;
-use crate::{Interests, Token};
-
+use crate::{Interest, Token};
 use log::error;
 use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{cmp, io, ptr, slice};
 
@@ -20,12 +19,20 @@ type Count = libc::c_int;
 type Count = libc::size_t;
 
 // Type of the `filter` field in the `kevent` structure.
-#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd"))]
 type Filter = libc::c_short;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 type Filter = i16;
 #[cfg(target_os = "netbsd")]
 type Filter = u32;
+
+// Type of the `flags` field in the `kevent` structure.
+#[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd"))]
+type Flags = libc::c_ushort;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+type Flags = u16;
+#[cfg(target_os = "netbsd")]
+type Flags = u32;
 
 // Type of the `data` field in the `kevent` structure.
 #[cfg(any(
@@ -35,7 +42,7 @@ type Filter = u32;
     target_os = "macos"
 ))]
 type Data = libc::intptr_t;
-#[cfg(any(target_os = "bitrig", target_os = "netbsd", target_os = "openbsd",))]
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 type Data = i64;
 
 // Type of the `udata` field in the `kevent` structure.
@@ -62,6 +69,8 @@ pub struct Selector {
     #[cfg(debug_assertions)]
     id: usize,
     kq: RawFd,
+    #[cfg(debug_assertions)]
+    has_waker: AtomicBool,
 }
 
 impl Selector {
@@ -72,20 +81,19 @@ impl Selector {
                 #[cfg(debug_assertions)]
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kq,
+                #[cfg(debug_assertions)]
+                has_waker: AtomicBool::new(false),
             })
     }
 
-    #[cfg(debug_assertions)]
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
     pub fn try_clone(&self) -> io::Result<Selector> {
-        syscall!(dup(self.kq)).map(|kq| Selector {
+        syscall!(fcntl(self.kq, libc::F_DUPFD_CLOEXEC, super::LOWEST_FD)).map(|kq| Selector {
             // It's the same selector, so we use the same id.
             #[cfg(debug_assertions)]
             id: self.id,
             kq,
+            #[cfg(debug_assertions)]
+            has_waker: AtomicBool::new(self.has_waker.load(Ordering::Acquire)),
         })
     }
 
@@ -119,7 +127,7 @@ impl Selector {
         })
     }
 
-    pub fn register(&self, fd: RawFd, token: Token, interests: Interests) -> io::Result<()> {
+    pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
         let flags = libc::EV_CLEAR | libc::EV_RECEIPT | libc::EV_ADD;
         // At most we need two changes, but maybe we only need 1.
         let mut changes: [MaybeUninit<libc::kevent>; 2] =
@@ -158,7 +166,7 @@ impl Selector {
         kevent_register(self.kq, changes, &[libc::EPIPE as Data])
     }
 
-    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interests) -> io::Result<()> {
+    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
         let flags = libc::EV_CLEAR | libc::EV_RECEIPT;
         let write_flags = if interests.is_writable() {
             flags | libc::EV_ADD
@@ -204,6 +212,11 @@ impl Selector {
         // the filter wasn't there in first place, but we don't really care
         // about that since our goal is to remove it.
         kevent_register(self.kq, &mut changes, &[libc::ENOENT as Data])
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn register_waker(&self) -> bool {
+        self.has_waker.swap(true, Ordering::AcqRel)
     }
 
     // Used by `Waker`.
@@ -290,6 +303,15 @@ fn check_errors(events: &[libc::kevent], ignored_errors: &[Data]) -> io::Result<
     Ok(())
 }
 
+cfg_io_source! {
+    #[cfg(debug_assertions)]
+    impl Selector {
+        pub fn id(&self) -> usize {
+            self.id
+        }
+    }
+}
+
 impl AsRawFd for Selector {
     fn as_raw_fd(&self) -> RawFd {
         self.kq
@@ -305,10 +327,43 @@ impl Drop for Selector {
 }
 
 pub type Event = libc::kevent;
+pub struct Events(Vec<libc::kevent>);
+
+impl Events {
+    pub fn with_capacity(capacity: usize) -> Events {
+        Events(Vec::with_capacity(capacity))
+    }
+}
+
+impl Deref for Events {
+    type Target = Vec<libc::kevent>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Events {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// `Events` cannot derive `Send` or `Sync` because of the
+// `udata: *mut ::c_void` field in `libc::kevent`. However, `Events`'s public
+// API treats the `udata` field as a `uintptr_t` which is `Send`. `Sync` is
+// safe because with a `events: &Events` value, the only access to the `udata`
+// field is through `fn token(event: &Event)` which cannot mutate the field.
+unsafe impl Send for Events {}
+unsafe impl Sync for Events {}
 
 pub mod event {
+    use std::fmt;
+
     use crate::sys::Event;
     use crate::Token;
+
+    use super::{Filter, Flags};
 
     pub fn token(event: &Event) -> Token {
         Token(event.udata as usize)
@@ -341,13 +396,12 @@ pub mod event {
             (event.flags & libc::EV_EOF) != 0 && event.fflags != 0
     }
 
-    pub fn is_hup(_: &Event) -> bool {
-        // Not supported.
-        false
+    pub fn is_read_closed(event: &Event) -> bool {
+        event.filter == libc::EVFILT_READ && event.flags & libc::EV_EOF != 0
     }
 
-    pub fn is_read_hup(event: &Event) -> bool {
-        event.filter == libc::EVFILT_READ && (event.flags & libc::EV_EOF) != 0
+    pub fn is_write_closed(event: &Event) -> bool {
+        event.filter == libc::EVFILT_WRITE && event.flags & libc::EV_EOF != 0
     }
 
     pub fn is_priority(_: &Event) -> bool {
@@ -388,20 +442,247 @@ pub mod event {
             false
         }
     }
+
+    pub fn debug_details(f: &mut fmt::Formatter<'_>, event: &Event) -> fmt::Result {
+        debug_detail!(
+            FilterDetails(Filter),
+            PartialEq::eq,
+            libc::EVFILT_READ,
+            libc::EVFILT_WRITE,
+            libc::EVFILT_AIO,
+            libc::EVFILT_VNODE,
+            libc::EVFILT_PROC,
+            libc::EVFILT_SIGNAL,
+            libc::EVFILT_TIMER,
+            #[cfg(target_os = "freebsd")]
+            libc::EVFILT_PROCDESC,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::EVFILT_FS,
+            #[cfg(target_os = "freebsd")]
+            libc::EVFILT_LIO,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::EVFILT_USER,
+            #[cfg(target_os = "freebsd")]
+            libc::EVFILT_SENDFILE,
+            #[cfg(target_os = "freebsd")]
+            libc::EVFILT_EMPTY,
+            #[cfg(target_os = "dragonfly")]
+            libc::EVFILT_EXCEPT,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::EVFILT_MACHPORT,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::EVFILT_VM,
+        );
+
+        #[allow(clippy::trivially_copy_pass_by_ref)]
+        fn check_flag(got: &Flags, want: &Flags) -> bool {
+            (got & want) != 0
+        }
+        debug_detail!(
+            FlagsDetails(Flags),
+            check_flag,
+            libc::EV_ADD,
+            libc::EV_DELETE,
+            libc::EV_ENABLE,
+            libc::EV_DISABLE,
+            libc::EV_ONESHOT,
+            libc::EV_CLEAR,
+            libc::EV_RECEIPT,
+            libc::EV_DISPATCH,
+            #[cfg(target_os = "freebsd")]
+            libc::EV_DROP,
+            libc::EV_FLAG1,
+            libc::EV_ERROR,
+            libc::EV_EOF,
+            libc::EV_SYSFLAGS,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::EV_FLAG0,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::EV_POLL,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::EV_OOBAND,
+            #[cfg(target_os = "dragonfly")]
+            libc::EV_NODATA,
+        );
+
+        #[allow(clippy::trivially_copy_pass_by_ref)]
+        fn check_fflag(got: &u32, want: &u32) -> bool {
+            (got & want) != 0
+        }
+        debug_detail!(
+            FflagsDetails(u32),
+            check_fflag,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_TRIGGER,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFNOP,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFAND,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFOR,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFCOPY,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFCTRLMASK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos"
+            ))]
+            libc::NOTE_FFLAGSMASK,
+            libc::NOTE_LOWAT,
+            libc::NOTE_DELETE,
+            libc::NOTE_WRITE,
+            #[cfg(target_os = "dragonfly")]
+            libc::NOTE_OOB,
+            #[cfg(target_os = "openbsd")]
+            libc::NOTE_EOF,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXTEND,
+            libc::NOTE_ATTRIB,
+            libc::NOTE_LINK,
+            libc::NOTE_RENAME,
+            libc::NOTE_REVOKE,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_NONE,
+            #[cfg(any(target_os = "openbsd"))]
+            libc::NOTE_TRUNCATE,
+            libc::NOTE_EXIT,
+            libc::NOTE_FORK,
+            libc::NOTE_EXEC,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_SIGNAL,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXITSTATUS,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXIT_DETAIL,
+            libc::NOTE_PDATAMASK,
+            libc::NOTE_PCTRLMASK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            libc::NOTE_TRACK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            libc::NOTE_TRACKERR,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            libc::NOTE_CHILD,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXIT_DETAIL_MASK,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXIT_DECRYPTFAIL,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXIT_MEMORY,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_EXIT_CSERROR,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_VM_PRESSURE,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_VM_PRESSURE_TERMINATE,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_VM_PRESSURE_SUDDEN_TERMINATE,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_VM_ERROR,
+            #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
+            libc::NOTE_SECONDS,
+            #[cfg(any(target_os = "freebsd"))]
+            libc::NOTE_MSECONDS,
+            #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
+            libc::NOTE_USECONDS,
+            #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
+            libc::NOTE_NSECONDS,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
+            libc::NOTE_ABSOLUTE,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_LEEWAY,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_CRITICAL,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            libc::NOTE_BACKGROUND,
+        );
+
+        // Can't reference fields in packed structures.
+        let ident = event.ident;
+        let data = event.data;
+        let udata = event.udata;
+        f.debug_struct("kevent")
+            .field("ident", &ident)
+            .field("filter", &FilterDetails(event.filter))
+            .field("flags", &FlagsDetails(event.flags))
+            .field("fflags", &FflagsDetails(event.fflags))
+            .field("data", &data)
+            .field("udata", &udata)
+            .finish()
+    }
 }
 
 #[test]
+#[cfg(feature = "os-ext")]
 fn does_not_register_rw() {
     use crate::unix::SourceFd;
     use crate::{Poll, Token};
 
     let kq = unsafe { libc::kqueue() };
-    let kqf = SourceFd(&kq);
+    let mut kqf = SourceFd(&kq);
     let poll = Poll::new().unwrap();
 
     // Registering kqueue fd will fail if write is requested (On anything but
     // some versions of macOS).
     poll.registry()
-        .register(&kqf, Token(1234), Interests::READABLE)
+        .register(&mut kqf, Token(1234), Interest::READABLE)
         .unwrap();
 }

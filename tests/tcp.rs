@@ -1,27 +1,36 @@
+#![cfg(all(feature = "os-poll", feature = "net"))]
+
+use mio::net::{TcpListener, TcpSocket, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-#[cfg(unix)]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::net::{self, Shutdown};
 use std::sync::mpsc::channel;
+use std::thread::{self, sleep};
 use std::time::Duration;
-use std::{net, thread};
 
-use bytes::{Buf, Bytes, BytesMut};
-use log::{debug, info};
-#[cfg(unix)]
-use net2::TcpStreamExt;
-use slab::Slab;
-
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interests, Poll, Registry, Token};
-
+#[macro_use]
 mod util;
-
-use util::{any_local_address, assert_send, assert_sync, init, TryRead, TryWrite};
+use util::{
+    any_local_address, assert_send, assert_sync, expect_events, expect_no_events, init,
+    init_with_poll, ExpectEvent,
+};
 
 const LISTEN: Token = Token(0);
 const CLIENT: Token = Token(1);
 const SERVER: Token = Token(2);
+
+#[test]
+#[cfg(all(unix, not(debug_assertions)))]
+fn assert_size() {
+    use mio::net::*;
+    use std::mem::size_of;
+
+    // Without debug assertions enabled `TcpListener`, `TcpStream` and
+    // `UdpSocket` should have the same size as the system specific socket, i.e.
+    // just a file descriptor on Unix platforms.
+    assert_eq!(size_of::<TcpListener>(), size_of::<std::net::TcpListener>());
+    assert_eq!(size_of::<TcpStream>(), size_of::<std::net::TcpStream>());
+}
 
 #[test]
 fn is_send_and_sync() {
@@ -36,116 +45,120 @@ fn is_send_and_sync() {
 fn accept() {
     init();
 
-    struct H {
+    struct Data {
         hit: bool,
         listener: TcpListener,
         shutdown: bool,
     }
 
-    let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = l.local_addr().unwrap();
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
 
-    let t = thread::spawn(move || {
+    let handle = thread::spawn(move || {
         net::TcpStream::connect(addr).unwrap();
     });
 
     let mut poll = Poll::new().unwrap();
 
     poll.registry()
-        .register(&l, Token(1), Interests::READABLE)
+        .register(&mut listener, Token(1), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
+    let mut data = Data {
         hit: false,
-        listener: l,
+        listener,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
-            h.hit = true;
+            data.hit = true;
             assert_eq!(event.token(), Token(1));
             assert!(event.is_readable());
-            assert!(h.listener.accept().is_ok());
-            h.shutdown = true;
+            assert!(data.listener.accept().is_ok());
+            data.shutdown = true;
         }
     }
-    assert!(h.hit);
-    assert!(h.listener.accept().unwrap_err().kind() == io::ErrorKind::WouldBlock);
-    t.join().unwrap();
+    assert!(data.hit);
+    assert!(data.listener.accept().unwrap_err().kind() == io::ErrorKind::WouldBlock);
+    handle.join().unwrap();
 }
 
 #[test]
 fn connect() {
     init();
 
-    struct H {
+    struct Data {
         hit: u32,
         shutdown: bool,
     }
 
-    let l = net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
     let (tx, rx) = channel();
     let (tx2, rx2) = channel();
-    let t = thread::spawn(move || {
-        let s = l.accept().unwrap();
+    let handle = thread::spawn(move || {
+        let stream = listener.accept().unwrap();
         rx.recv().unwrap();
-        drop(s);
+        drop(stream);
         tx2.send(()).unwrap();
     });
 
     let mut poll = Poll::new().unwrap();
-    let s = TcpStream::connect(addr).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&s, Token(1), Interests::READABLE | Interests::WRITABLE)
+        .register(
+            &mut stream,
+            Token(1),
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
+    let mut data = Data {
         hit: 0,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            match h.hit {
+            match data.hit {
                 0 => assert!(event.is_writable()),
                 1 => assert!(event.is_readable()),
                 _ => panic!(),
             }
-            h.hit += 1;
-            h.shutdown = true;
+            data.hit += 1;
+            data.shutdown = true;
         }
     }
-    assert_eq!(h.hit, 1);
+    assert_eq!(data.hit, 1);
     tx.send(()).unwrap();
     rx2.recv().unwrap();
-    h.shutdown = false;
-    while !h.shutdown {
+    data.shutdown = false;
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            match h.hit {
+            match data.hit {
                 0 => assert!(event.is_writable()),
                 1 => assert!(event.is_readable()),
                 _ => panic!(),
             }
-            h.hit += 1;
-            h.shutdown = true;
+            data.hit += 1;
+            data.shutdown = true;
         }
     }
-    assert_eq!(h.hit, 2);
-    t.join().unwrap();
+    assert_eq!(data.hit, 2);
+    handle.join().unwrap();
 }
 
 #[test]
@@ -153,58 +166,58 @@ fn read() {
     init();
 
     const N: usize = 16 * 1024 * 1024;
-    struct H {
+    struct Data {
         amt: usize,
         socket: TcpStream,
         shutdown: bool,
     }
 
-    let l = net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
-    let t = thread::spawn(move || {
-        let mut s = l.accept().unwrap().0;
-        let b = [0; 1024];
+    let handle = thread::spawn(move || {
+        let mut stream = listener.accept().unwrap().0;
+        let buf = [0; 1024];
         let mut amt = 0;
         while amt < N {
-            amt += s.write(&b).unwrap();
+            amt += stream.write(&buf).unwrap();
         }
     });
 
     let mut poll = Poll::new().unwrap();
-    let s = TcpStream::connect(addr).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&s, Token(1), Interests::READABLE)
+        .register(&mut stream, Token(1), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
+    let mut data = Data {
         amt: 0,
-        socket: s,
+        socket: stream,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            let mut b = [0; 1024];
+            let mut buf = [0; 1024];
             loop {
-                if let Some(amt) = h.socket.try_read(&mut b).unwrap() {
-                    h.amt += amt;
+                if let Ok(amt) = data.socket.read(&mut buf) {
+                    data.amt += amt;
                 } else {
                     break;
                 }
-                if h.amt >= N {
-                    h.shutdown = true;
+                if data.amt >= N {
+                    data.shutdown = true;
                     break;
                 }
             }
         }
     }
-    t.join().unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
@@ -212,64 +225,64 @@ fn peek() {
     init();
 
     const N: usize = 16 * 1024 * 1024;
-    struct H {
+    struct Data {
         amt: usize,
         socket: TcpStream,
         shutdown: bool,
     }
 
-    let l = net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
-    let t = thread::spawn(move || {
-        let mut s = l.accept().unwrap().0;
-        let b = [0; 1024];
+    let handle = thread::spawn(move || {
+        let mut stream = listener.accept().unwrap().0;
+        let buf = [0; 1024];
         let mut amt = 0;
         while amt < N {
-            amt += s.write(&b).unwrap();
+            amt += stream.write(&buf).unwrap();
         }
     });
 
     let mut poll = Poll::new().unwrap();
-    let s = TcpStream::connect(addr).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&s, Token(1), Interests::READABLE)
+        .register(&mut stream, Token(1), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
+    let mut data = Data {
         amt: 0,
-        socket: s,
+        socket: stream,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            let mut b = [0; 1024];
-            match h.socket.peek(&mut b) {
+            let mut buf = [0; 1024];
+            match data.socket.peek(&mut buf) {
                 Ok(_) => (),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("unexpected error: {:?}", e),
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => panic!("unexpected error: {}", err),
             }
 
             loop {
-                if let Some(amt) = h.socket.try_read(&mut b).unwrap() {
-                    h.amt += amt;
+                if let Ok(amt) = data.socket.read(&mut buf) {
+                    data.amt += amt;
                 } else {
                     break;
                 }
-                if h.amt >= N {
-                    h.shutdown = true;
+                if data.amt >= N {
+                    data.shutdown = true;
                     break;
                 }
             }
         }
     }
-    t.join().unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
@@ -277,98 +290,98 @@ fn write() {
     init();
 
     const N: usize = 16 * 1024 * 1024;
-    struct H {
+    struct Data {
         amt: usize,
         socket: TcpStream,
         shutdown: bool,
     }
 
-    let l = net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
-    let t = thread::spawn(move || {
-        let mut s = l.accept().unwrap().0;
-        let mut b = [0; 1024];
+    let handle = thread::spawn(move || {
+        let mut stream = listener.accept().unwrap().0;
+        let mut buf = [0; 1024];
         let mut amt = 0;
         while amt < N {
-            amt += s.read(&mut b).unwrap();
+            amt += stream.read(&mut buf).unwrap();
         }
     });
 
     let mut poll = Poll::new().unwrap();
-    let s = TcpStream::connect(addr).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&s, Token(1), Interests::WRITABLE)
+        .register(&mut stream, Token(1), Interest::WRITABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
+    let mut data = Data {
         amt: 0,
-        socket: s,
+        socket: stream,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            let b = [0; 1024];
+            let buf = [0; 1024];
             loop {
-                if let Some(amt) = h.socket.try_write(&b).unwrap() {
-                    h.amt += amt;
+                if let Ok(amt) = data.socket.write(&buf) {
+                    data.amt += amt;
                 } else {
                     break;
                 }
-                if h.amt >= N {
-                    h.shutdown = true;
+                if data.amt >= N {
+                    data.shutdown = true;
                     break;
                 }
             }
         }
     }
-    t.join().unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
 fn connect_then_close() {
     init();
 
-    struct H {
+    struct Data {
         listener: TcpListener,
         shutdown: bool,
     }
 
     let mut poll = Poll::new().unwrap();
-    let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut s = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
 
     poll.registry()
-        .register(&l, Token(1), Interests::READABLE)
+        .register(&mut listener, Token(1), Interest::READABLE)
         .unwrap();
     poll.registry()
-        .register(&s, Token(2), Interests::READABLE)
+        .register(&mut s, Token(2), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    let mut h = H {
-        listener: l,
+    let mut data = Data {
+        listener,
         shutdown: false,
     };
-    while !h.shutdown {
+    while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             if event.token() == Token(1) {
-                let s = h.listener.accept().unwrap().0;
+                let mut s = data.listener.accept().unwrap().0;
                 poll.registry()
-                    .register(&s, Token(3), Interests::READABLE | Interests::WRITABLE)
+                    .register(&mut s, Token(3), Interest::READABLE | Interest::WRITABLE)
                     .unwrap();
                 drop(s);
             } else if event.token() == Token(2) {
-                h.shutdown = true;
+                data.shutdown = true;
             }
         }
     }
@@ -379,12 +392,12 @@ fn listen_then_close() {
     init();
 
     let mut poll = Poll::new().unwrap();
-    let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
 
     poll.registry()
-        .register(&l, Token(1), Interests::READABLE)
+        .register(&mut listener, Token(1), Interest::READABLE)
         .unwrap();
-    drop(l);
+    drop(listener);
 
     let mut events = Events::with_capacity(128);
 
@@ -412,11 +425,11 @@ fn multiple_writes_immediate_success() {
     init();
 
     const N: usize = 16;
-    let l = net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
-    let t = thread::spawn(move || {
-        let mut s = l.accept().unwrap().0;
+    let handle = thread::spawn(move || {
+        let mut s = listener.accept().unwrap().0;
         let mut b = [0; 1024];
         let mut amt = 0;
         while amt < 1024 * N {
@@ -434,7 +447,7 @@ fn multiple_writes_immediate_success() {
     let mut poll = Poll::new().unwrap();
     let mut s = TcpStream::connect(addr).unwrap();
     poll.registry()
-        .register(&s, Token(1), Interests::WRITABLE)
+        .register(&mut s, Token(1), Interest::WRITABLE)
         .unwrap();
     let mut events = Events::with_capacity(16);
 
@@ -452,11 +465,10 @@ fn multiple_writes_immediate_success() {
         s.write_all(&[1; 1024]).unwrap();
     }
 
-    t.join().unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
-#[cfg(unix)]
 fn connection_reset_by_peer() {
     init();
 
@@ -465,27 +477,26 @@ fn connection_reset_by_peer() {
     let mut buf = [0u8; 16];
 
     // Create listener
-    let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = l.local_addr().unwrap();
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
 
     // Connect client
-    let client = net2::TcpBuilder::new_v4().unwrap().to_tcp_stream().unwrap();
-
+    let client = TcpSocket::new_v4().unwrap();
     client.set_linger(Some(Duration::from_millis(0))).unwrap();
-    client.connect(&addr).unwrap();
-
-    // Convert to Mio stream
-    // FIXME: how to convert the stream on Windows?
-    let client = unsafe { TcpStream::from_raw_fd(client.into_raw_fd()) };
+    let mut client = client.connect(addr).unwrap();
 
     // Register server
     poll.registry()
-        .register(&l, Token(0), Interests::READABLE)
+        .register(&mut listener, Token(0), Interest::READABLE)
         .unwrap();
 
     // Register interest in the client
     poll.registry()
-        .register(&client, Token(1), Interests::READABLE | Interests::WRITABLE)
+        .register(
+            &mut client,
+            Token(1),
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .unwrap();
 
     // Wait for listener to be ready
@@ -495,7 +506,7 @@ fn connection_reset_by_peer() {
 
         for event in &events {
             if event.token() == Token(0) {
-                match l.accept() {
+                match listener.accept() {
                     Ok((sock, _)) => {
                         server = sock;
                         break 'outer;
@@ -511,11 +522,11 @@ fn connection_reset_by_peer() {
     drop(client);
 
     // Wait a moment
-    thread::sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(100));
 
     // Register interest in the server socket
     poll.registry()
-        .register(&server, Token(3), Interests::READABLE)
+        .register(&mut server, Token(3), Interest::READABLE)
         .unwrap();
 
     loop {
@@ -538,13 +549,10 @@ fn connection_reset_by_peer() {
 
 #[test]
 fn connect_error() {
-    init();
-
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(16);
+    let (mut poll, mut events) = init_with_poll();
 
     // Pick a "random" port that shouldn't be in use.
-    let l = match TcpStream::connect("127.0.0.1:38381".parse().unwrap()) {
+    let mut stream = match TcpStream::connect("127.0.0.1:58381".parse().unwrap()) {
         Ok(l) => l,
         Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => {
             // Connection failed synchronously.  This is not a bug, but it
@@ -555,7 +563,7 @@ fn connect_error() {
     };
 
     poll.registry()
-        .register(&l, Token(0), Interests::WRITABLE)
+        .register(&mut stream, Token(0), Interest::WRITABLE)
         .unwrap();
 
     'outer: loop {
@@ -564,12 +572,13 @@ fn connect_error() {
         for event in &events {
             if event.token() == Token(0) {
                 assert!(event.is_writable());
+                assert!(event.is_write_closed());
                 break 'outer;
             }
         }
     }
 
-    assert!(l.take_error().unwrap().is_some());
+    assert!(stream.take_error().unwrap().is_some());
 }
 
 #[test]
@@ -582,7 +591,7 @@ fn write_error() {
 
     let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let t = thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let (conn, _addr) = listener.accept().unwrap();
         rx.recv().unwrap();
         drop(conn);
@@ -590,7 +599,7 @@ fn write_error() {
 
     let mut s = TcpStream::connect(addr).unwrap();
     poll.registry()
-        .register(&s, Token(0), Interests::READABLE | Interests::WRITABLE)
+        .register(&mut s, Token(0), Interest::READABLE | Interest::WRITABLE)
         .unwrap();
 
     let mut wait_writable = || 'outer: loop {
@@ -606,7 +615,7 @@ fn write_error() {
     wait_writable();
 
     tx.send(()).unwrap();
-    t.join().unwrap();
+    handle.join().unwrap();
 
     let buf = [0; 1024];
     loop {
@@ -622,7 +631,7 @@ fn write_error() {
 }
 
 macro_rules! wait {
-    ($poll:ident, $ready:ident, $expect_hup: expr) => {{
+    ($poll:ident, $ready:ident, $expect_read_closed: expr) => {{
         use std::time::Instant;
 
         let now = Instant::now();
@@ -639,24 +648,10 @@ macro_rules! wait {
                 .unwrap();
 
             for event in &events {
-                // Hup is only generated on kqueue platforms.
-                #[cfg(any(
-                    target_os = "bitrig",
-                    target_os = "dragonfly",
-                    target_os = "freebsd",
-                    target_os = "ios",
-                    target_os = "macos",
-                    target_os = "netbsd",
-                    target_os = "openbsd"
-                ))]
-                {
-                    if $expect_hup {
-                        assert!(event.is_read_hup());
-                    }
-                }
-
-                if !$expect_hup {
-                    assert!(!event.is_hup());
+                if $expect_read_closed {
+                    assert!(event.is_read_closed());
+                } else {
+                    assert!(!event.is_read_closed() && !event.is_write_closed());
                 }
 
                 if event.token() == Token(0) && event.$ready() {
@@ -669,7 +664,7 @@ macro_rules! wait {
 }
 
 #[test]
-fn test_write_shutdown() {
+fn write_shutdown() {
     init();
 
     let mut poll = Poll::new().unwrap();
@@ -677,11 +672,13 @@ fn test_write_shutdown() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let interests = Interests::READABLE | Interests::WRITABLE;
-
-    let client = TcpStream::connect(addr).unwrap();
+    let mut client = TcpStream::connect(addr).unwrap();
     poll.registry()
-        .register(&client, Token(0), interests)
+        .register(
+            &mut client,
+            Token(0),
+            Interest::READABLE.add(Interest::WRITABLE),
+        )
         .unwrap();
 
     let (socket, _) = listener.accept().unwrap();
@@ -716,17 +713,17 @@ fn local_addr_ready() {
     init();
 
     let addr = "127.0.0.1:0".parse().unwrap();
-    let server = TcpListener::bind(addr).unwrap();
+    let mut server = TcpListener::bind(addr).unwrap();
     let addr = server.local_addr().unwrap();
 
     let mut poll = Poll::new().unwrap();
     poll.registry()
-        .register(&server, LISTEN, Interests::READABLE)
+        .register(&mut server, LISTEN, Interest::READABLE)
         .unwrap();
 
-    let sock = TcpStream::connect(addr).unwrap();
+    let mut sock = TcpStream::connect(addr).unwrap();
     poll.registry()
-        .register(&sock, CLIENT, Interests::READABLE)
+        .register(&mut sock, CLIENT, Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -744,21 +741,22 @@ fn local_addr_ready() {
         for event in &events {
             match event.token() {
                 LISTEN => {
-                    let sock = handler.listener.accept().unwrap().0;
+                    let mut sock = handler.listener.accept().unwrap().0;
                     poll.registry()
-                        .register(&sock, SERVER, Interests::WRITABLE)
+                        .register(&mut sock, SERVER, Interest::WRITABLE)
                         .unwrap();
                     handler.accepted = Some(sock);
                 }
                 SERVER => {
                     handler.accepted.as_ref().unwrap().peer_addr().unwrap();
                     handler.accepted.as_ref().unwrap().local_addr().unwrap();
-                    handler
+                    let n = handler
                         .accepted
                         .as_mut()
                         .unwrap()
-                        .try_write(&[1, 2, 3])
+                        .write(&[1, 2, 3])
                         .unwrap();
+                    assert_eq!(n, 3);
                     handler.accepted = None;
                 }
                 CLIENT => {
@@ -772,338 +770,22 @@ fn local_addr_ready() {
     }
 }
 
-struct EchoConn {
-    sock: TcpStream,
-    buf: Option<Bytes>,
-    mut_buf: Option<BytesMut>,
-    token: Option<Token>,
-    interests: Option<Interests>,
-}
-
-impl EchoConn {
-    fn new(sock: TcpStream) -> EchoConn {
-        EchoConn {
-            sock,
-            buf: None,
-            mut_buf: Some(BytesMut::with_capacity(2048)),
-            token: None,
-            interests: None,
-        }
-    }
-
-    fn writable(&mut self, registry: &Registry) -> io::Result<()> {
-        let mut buf = self.buf.take().unwrap();
-
-        match self.sock.try_write_buf(&mut buf) {
-            Ok(None) => {
-                debug!("client flushing buf; WOULDBLOCK");
-
-                self.buf = Some(buf);
-                self.interests = match self.interests {
-                    None => Some(Interests::WRITABLE),
-                    Some(i) => Some(i | Interests::WRITABLE),
-                };
-            }
-            Ok(Some(r)) => {
-                debug!("CONN : we wrote {} bytes!", r);
-
-                self.mut_buf = Some(buf.try_mut().unwrap());
-
-                self.interests = Some(Interests::READABLE);
-            }
-            Err(e) => debug!("not implemented; client err={:?}", e),
-        }
-
-        assert!(
-            self.interests.unwrap().is_readable() || self.interests.unwrap().is_writable(),
-            "actual={:?}",
-            self.interests
-        );
-        registry.reregister(&self.sock, self.token.unwrap(), self.interests.unwrap())
-    }
-
-    fn readable(&mut self, registry: &Registry) -> io::Result<()> {
-        let mut buf = self.mut_buf.take().unwrap();
-        buf.clear();
-
-        match self.sock.try_read_buf(&mut buf) {
-            Ok(None) => {
-                debug!("CONN : spurious read wakeup");
-                self.mut_buf = Some(buf);
-            }
-            Ok(Some(r)) => {
-                debug!("CONN : we read {} bytes!", r);
-
-                // prepare to provide this to writable
-                self.buf = Some(buf.freeze());
-
-                self.interests = Some(Interests::WRITABLE);
-            }
-            Err(e) => {
-                debug!("not implemented; client err={:?}", e);
-                if self.interests == Some(Interests::READABLE) {
-                    self.interests = None;
-                } else if let Some(x) = self.interests.as_mut() {
-                    *x = Interests::WRITABLE;
-                }
-            }
-        };
-
-        assert!(
-            self.interests.unwrap().is_readable() || self.interests.unwrap().is_writable(),
-            "actual={:?}",
-            self.interests
-        );
-        registry.reregister(&self.sock, self.token.unwrap(), self.interests.unwrap())
-    }
-}
-
-struct EchoServer {
-    sock: TcpListener,
-    conns: Slab<EchoConn>,
-}
-
-impl EchoServer {
-    fn accept(&mut self, registry: &Registry) -> io::Result<()> {
-        debug!("server accepting socket");
-
-        let sock = self.sock.accept().unwrap().0;
-        let conn = EchoConn::new(sock);
-        let tok = self.conns.insert(conn);
-
-        // Register the connection
-        self.conns[tok].token = Some(Token(tok));
-        registry
-            .register(&self.conns[tok].sock, Token(tok), Interests::READABLE)
-            .expect("could not register socket with event loop");
-
-        Ok(())
-    }
-
-    fn conn_readable(&mut self, registry: &Registry, tok: Token) -> io::Result<()> {
-        debug!("server conn readable; tok={:?}", tok);
-        self.conn(tok).readable(registry)
-    }
-
-    fn conn_writable(&mut self, registry: &Registry, tok: Token) -> io::Result<()> {
-        debug!("server conn writable; tok={:?}", tok);
-        self.conn(tok).writable(registry)
-    }
-
-    fn conn(&mut self, tok: Token) -> &mut EchoConn {
-        &mut self.conns[tok.into()]
-    }
-}
-
-struct EchoClient {
-    sock: TcpStream,
-    msgs: Vec<&'static str>,
-    tx: Bytes,
-    rx: Bytes,
-    mut_buf: Option<BytesMut>,
-    token: Token,
-    interests: Option<Interests>,
-    shutdown: bool,
-}
-
-// Sends a message and expects to receive the same exact message, one at a time
-impl EchoClient {
-    fn new(sock: TcpStream, token: Token, mut msgs: Vec<&'static str>) -> EchoClient {
-        let curr = msgs.remove(0);
-
-        EchoClient {
-            sock,
-            msgs,
-            tx: Bytes::from_static(curr.as_bytes()),
-            rx: Bytes::from_static(curr.as_bytes()),
-            mut_buf: Some(BytesMut::with_capacity(2048)),
-            token,
-            interests: None,
-            shutdown: false,
-        }
-    }
-
-    fn readable(&mut self, registry: &Registry) -> io::Result<()> {
-        debug!("client socket readable");
-
-        let mut buf = self.mut_buf.take().unwrap();
-        buf.clear();
-
-        match self.sock.try_read_buf(&mut buf) {
-            Ok(None) => {
-                debug!("CLIENT : spurious read wakeup");
-                self.mut_buf = Some(buf);
-            }
-            Ok(Some(r)) => {
-                debug!("CLIENT : We read {} bytes!", r);
-
-                // prepare for reading
-                let mut buf = buf.freeze();
-
-                while buf.has_remaining() {
-                    let actual = buf.get_u8();
-                    let expect = self.rx.get_u8();
-
-                    assert!(actual == expect, "actual={}; expect={}", actual, expect);
-                }
-
-                self.mut_buf = Some(buf.try_mut().unwrap());
-
-                if self.interests == Some(Interests::READABLE) {
-                    self.interests = None;
-                } else if let Some(x) = self.interests.as_mut() {
-                    *x = Interests::WRITABLE;
-                }
-
-                if !self.rx.has_remaining() {
-                    self.next_msg(registry).unwrap();
-                }
-            }
-            Err(e) => {
-                panic!("not implemented; client err={:?}", e);
-            }
-        };
-
-        if let Some(x) = self.interests {
-            registry.reregister(&self.sock, self.token, x)?;
-        }
-
-        Ok(())
-    }
-
-    fn writable(&mut self, registry: &Registry) -> io::Result<()> {
-        debug!("client socket writable");
-
-        match self.sock.try_write_buf(&mut self.tx) {
-            Ok(None) => {
-                debug!("client flushing buf; WOULDBLOCK");
-                self.interests = match self.interests {
-                    None => Some(Interests::WRITABLE),
-                    Some(i) => Some(i | Interests::WRITABLE),
-                };
-            }
-            Ok(Some(r)) => {
-                debug!("CLIENT : we wrote {} bytes!", r);
-                self.interests = match self.interests {
-                    None => Some(Interests::READABLE),
-                    Some(_) => Some(Interests::READABLE),
-                };
-            }
-            Err(e) => debug!("not implemented; client err={:?}", e),
-        }
-
-        if self.interests.unwrap().is_readable() || self.interests.unwrap().is_writable() {
-            registry.reregister(&self.sock, self.token, self.interests.unwrap())?;
-        }
-
-        Ok(())
-    }
-
-    fn next_msg(&mut self, registry: &Registry) -> io::Result<()> {
-        if self.msgs.is_empty() {
-            self.shutdown = true;
-            return Ok(());
-        }
-
-        let curr = self.msgs.remove(0);
-
-        debug!("client prepping next message");
-        self.tx = Bytes::from_static(curr.as_bytes());
-        self.rx = Bytes::from_static(curr.as_bytes());
-
-        self.interests = match self.interests {
-            None => Some(Interests::WRITABLE),
-            Some(i) => Some(i | Interests::WRITABLE),
-        };
-        registry.reregister(&self.sock, self.token, self.interests.unwrap())
-    }
-}
-
-struct Echo {
-    server: EchoServer,
-    client: EchoClient,
-}
-
-impl Echo {
-    fn new(srv: TcpListener, client: TcpStream, msgs: Vec<&'static str>) -> Echo {
-        Echo {
-            server: EchoServer {
-                sock: srv,
-                conns: Slab::with_capacity(128),
-            },
-            client: EchoClient::new(client, CLIENT, msgs),
-        }
-    }
-}
-
-#[test]
-pub fn test_echo_server() {
-    init();
-
-    debug!("Starting TEST_ECHO_SERVER");
-    let mut poll = Poll::new().unwrap();
-
-    let srv = TcpListener::bind(any_local_address()).unwrap();
-    let addr = srv.local_addr().unwrap();
-
-    info!("listen for connections");
-    poll.registry()
-        .register(&srv, SERVER, Interests::READABLE)
-        .unwrap();
-
-    let sock = TcpStream::connect(addr).unwrap();
-
-    // Connect to the server
-    poll.registry()
-        .register(&sock, CLIENT, Interests::WRITABLE)
-        .unwrap();
-
-    // == Create storage for events
-    let mut events = Events::with_capacity(1024);
-
-    let mut handler = Echo::new(srv, sock, vec!["foo", "bar"]);
-
-    // Start the event loop
-    while !handler.client.shutdown {
-        poll.poll(&mut events, None).unwrap();
-
-        for event in &events {
-            debug!("ready {:?} {:?}", event.token(), event);
-            if event.is_readable() {
-                match event.token() {
-                    SERVER => handler.server.accept(poll.registry()).unwrap(),
-                    CLIENT => handler.client.readable(poll.registry()).unwrap(),
-                    i => handler.server.conn_readable(poll.registry(), i).unwrap(),
-                }
-            }
-
-            if event.is_writable() {
-                match event.token() {
-                    SERVER => panic!("received writable for token 0"),
-                    CLIENT => handler.client.writable(poll.registry()).unwrap(),
-                    i => handler.server.conn_writable(poll.registry(), i).unwrap(),
-                };
-            }
-        }
-    }
-}
-
 #[test]
 fn write_then_drop() {
     init();
 
-    let a = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut a = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = a.local_addr().unwrap();
     let mut s = TcpStream::connect(addr).unwrap();
 
     let mut poll = Poll::new().unwrap();
 
     poll.registry()
-        .register(&a, Token(1), Interests::READABLE)
+        .register(&mut a, Token(1), Interest::READABLE)
         .unwrap();
 
     poll.registry()
-        .register(&s, Token(3), Interests::READABLE)
+        .register(&mut s, Token(3), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1116,7 +798,7 @@ fn write_then_drop() {
     let mut s2 = a.accept().unwrap().0;
 
     poll.registry()
-        .register(&s2, Token(2), Interests::WRITABLE)
+        .register(&mut s2, Token(2), Interest::WRITABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1130,7 +812,7 @@ fn write_then_drop() {
     drop(s2);
 
     poll.registry()
-        .reregister(&s, Token(3), Interests::READABLE)
+        .reregister(&mut s, Token(3), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1141,25 +823,24 @@ fn write_then_drop() {
     assert_eq!(events.iter().next().unwrap().token(), Token(3));
 
     let mut buf = [0; 10];
-    assert_eq!(s.read(&mut buf).unwrap(), 4);
-    assert_eq!(&buf[0..4], &[1, 2, 3, 4]);
+    expect_read!(s.read(&mut buf), &[1, 2, 3, 4]);
 }
 
 #[test]
 fn write_then_deregister() {
     init();
 
-    let a = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut a = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = a.local_addr().unwrap();
     let mut s = TcpStream::connect(addr).unwrap();
 
     let mut poll = Poll::new().unwrap();
 
     poll.registry()
-        .register(&a, Token(1), Interests::READABLE)
+        .register(&mut a, Token(1), Interest::READABLE)
         .unwrap();
     poll.registry()
-        .register(&s, Token(3), Interests::READABLE)
+        .register(&mut s, Token(3), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1172,7 +853,7 @@ fn write_then_deregister() {
     let mut s2 = a.accept().unwrap().0;
 
     poll.registry()
-        .register(&s2, Token(2), Interests::WRITABLE)
+        .register(&mut s2, Token(2), Interest::WRITABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1183,10 +864,10 @@ fn write_then_deregister() {
     assert_eq!(events.iter().next().unwrap().token(), Token(2));
 
     s2.write_all(&[1, 2, 3, 4]).unwrap();
-    poll.registry().deregister(&s2).unwrap();
+    poll.registry().deregister(&mut s2).unwrap();
 
     poll.registry()
-        .reregister(&s, Token(3), Interests::READABLE)
+        .reregister(&mut s, Token(3), Interest::READABLE)
         .unwrap();
 
     let mut events = Events::with_capacity(1024);
@@ -1197,6 +878,70 @@ fn write_then_deregister() {
     assert_eq!(events.iter().next().unwrap().token(), Token(3));
 
     let mut buf = [0; 10];
-    assert_eq!(s.read(&mut buf).unwrap(), 4);
-    assert_eq!(&buf[0..4], &[1, 2, 3, 4]);
+    expect_read!(s.read(&mut buf), &[1, 2, 3, 4]);
+}
+
+const ID1: Token = Token(1);
+const ID2: Token = Token(2);
+const ID3: Token = Token(3);
+
+#[test]
+fn tcp_no_events_after_deregister() {
+    let (mut poll, mut events) = init_with_poll();
+
+    let mut listener = TcpListener::bind(any_local_address()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
+
+    poll.registry()
+        .register(&mut listener, ID1, Interest::READABLE)
+        .unwrap();
+    poll.registry()
+        .register(&mut stream, ID3, Interest::READABLE)
+        .unwrap();
+
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(ID1, Interest::READABLE)],
+    );
+
+    let (mut stream2, peer_address) = listener.accept().expect("unable to accept connection");
+    assert!(peer_address.ip().is_loopback());
+    assert_eq!(stream2.peer_addr().unwrap(), peer_address);
+    assert_eq!(stream2.local_addr().unwrap(), addr);
+
+    poll.registry()
+        .register(&mut stream2, ID2, Interest::WRITABLE)
+        .unwrap();
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(ID2, Interest::WRITABLE)],
+    );
+
+    stream2.write_all(&[1, 2, 3, 4]).unwrap();
+
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(ID3, Interest::READABLE)],
+    );
+
+    poll.registry().deregister(&mut listener).unwrap();
+    poll.registry().deregister(&mut stream).unwrap();
+    poll.registry().deregister(&mut stream2).unwrap();
+
+    expect_no_events(&mut poll, &mut events);
+
+    let mut buf = [0; 10];
+    expect_read!(stream.read(&mut buf), &[1, 2, 3, 4]);
+
+    checked_write!(stream2.write(&[1, 2, 3, 4]));
+    expect_no_events(&mut poll, &mut events);
+
+    sleep(Duration::from_millis(200));
+    expect_read!(stream.read(&mut buf), &[1, 2, 3, 4]);
+
+    expect_no_events(&mut poll, &mut events);
 }

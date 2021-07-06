@@ -1,12 +1,13 @@
-use bytes::BytesMut;
-use log::debug;
+#![cfg(all(feature = "os-poll", feature = "net"))]
 
+use std::io::Read;
+
+use log::debug;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interests, Poll, Token};
+use mio::{Events, Interest, Poll, Token};
 
 mod util;
-
-use util::{any_local_address, init, TryRead};
+use util::{any_local_address, init};
 
 use self::TestState::{AfterRead, Initial};
 
@@ -50,16 +51,16 @@ impl TestHandler {
                 match self.state {
                     Initial => {
                         let mut buf = [0; 4096];
-                        debug!("GOT={:?}", self.cli.try_read(&mut buf[..]));
+                        debug!("GOT={:?}", self.cli.read(&mut buf[..]));
                         self.state = AfterRead;
                     }
                     AfterRead => {}
                 }
 
-                let mut buf = BytesMut::with_capacity(1024);
+                let mut buf = Vec::with_capacity(1024);
 
-                match self.cli.try_read_buf(&mut buf) {
-                    Ok(Some(0)) => self.shutdown = true,
+                match self.cli.read(&mut buf) {
+                    Ok(0) => self.shutdown = true,
                     Ok(_) => panic!("the client socket should not be readable"),
                     Err(e) => panic!("Unexpected error {:?}", e),
                 }
@@ -67,7 +68,7 @@ impl TestHandler {
             _ => panic!("received unknown token {:?}", tok),
         }
         poll.registry()
-            .reregister(&self.cli, CLIENT, Interests::READABLE)
+            .reregister(&mut self.cli, CLIENT, Interest::READABLE)
             .unwrap();
     }
 
@@ -77,7 +78,7 @@ impl TestHandler {
             CLIENT => {
                 debug!("client connected");
                 poll.registry()
-                    .reregister(&self.cli, CLIENT, Interests::READABLE)
+                    .reregister(&mut self.cli, CLIENT, Interest::READABLE)
                     .unwrap();
             }
             _ => panic!("received unknown token {:?}", tok),
@@ -86,24 +87,24 @@ impl TestHandler {
 }
 
 #[test]
-pub fn test_close_on_drop() {
+pub fn close_on_drop() {
     init();
     debug!("Starting TEST_CLOSE_ON_DROP");
     let mut poll = Poll::new().unwrap();
 
     // == Create & setup server socket
-    let srv = TcpListener::bind(any_local_address()).unwrap();
+    let mut srv = TcpListener::bind(any_local_address()).unwrap();
     let addr = srv.local_addr().unwrap();
 
     poll.registry()
-        .register(&srv, SERVER, Interests::READABLE)
+        .register(&mut srv, SERVER, Interest::READABLE)
         .unwrap();
 
     // == Create & setup client socket
-    let sock = TcpStream::connect(addr).unwrap();
+    let mut sock = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&sock, CLIENT, Interests::WRITABLE)
+        .register(&mut sock, CLIENT, Interest::WRITABLE)
         .unwrap();
 
     // == Create storage for events

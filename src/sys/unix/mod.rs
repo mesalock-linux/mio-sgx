@@ -1,56 +1,72 @@
 /// Helper macro to execute a system call that returns an `io::Result`.
 //
 // Macro must be defined before any modules that uses them.
+#[allow(unused_macros)]
 macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
         let res = unsafe { libc::$fn($($arg, )*) };
         if res == -1 {
-            Err(io::Error::last_os_error())
+            Err(std::io::Error::last_os_error())
         } else {
             Ok(res)
         }
     }};
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "solaris"))]
-mod epoll;
+cfg_os_poll! {
+    mod selector;
+    pub(crate) use self::selector::{event, Event, Events, Selector};
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "solaris"))]
-pub use self::epoll::{event, Event, Selector};
+    mod sourcefd;
+    pub use self::sourcefd::SourceFd;
 
-#[cfg(any(
-    target_os = "bitrig",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-mod kqueue;
+    mod waker;
+    pub(crate) use self::waker::Waker;
 
-#[cfg(any(
-    target_os = "bitrig",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-pub use self::kqueue::{event, Event, Selector};
+    cfg_net! {
+        mod net;
 
-mod net;
-mod sourcefd;
-mod tcp_listener;
-mod tcp_stream;
-mod udp;
-mod waker;
+        pub(crate) mod tcp;
+        pub(crate) mod udp;
+        pub(crate) mod uds;
+        pub use self::uds::SocketAddr;
+    }
 
-pub use self::sourcefd::SourceFd;
-pub use self::tcp_listener::TcpListener;
-pub use self::tcp_stream::TcpStream;
-pub use self::udp::UdpSocket;
-pub use self::waker::Waker;
+    cfg_io_source! {
+        use std::io;
 
-pub type Events = Vec<Event>;
+        // Both `kqueue` and `epoll` don't need to hold any user space state.
+        pub(crate) struct IoSourceState;
+
+        impl IoSourceState {
+            pub fn new() -> IoSourceState {
+                IoSourceState
+            }
+
+            pub fn do_io<T, F, R>(&self, f: F, io: &T) -> io::Result<R>
+            where
+                F: FnOnce(&T) -> io::Result<R>,
+            {
+                // We don't hold state, so we can just call the function and
+                // return.
+                f(io)
+            }
+        }
+    }
+
+    cfg_os_ext! {
+        pub(crate) mod pipe;
+    }
+}
+
+cfg_not_os_poll! {
+    cfg_net! {
+        mod uds;
+        pub use self::uds::SocketAddr;
+    }
+
+    cfg_any_os_ext! {
+        mod sourcefd;
+        pub use self::sourcefd::SourceFd;
+    }
+}

@@ -1,6 +1,7 @@
 # Mio – Metal IO
 
-Mio is a lightweight I/O library for Rust with a focus on adding as little
+Mio is a fast, low-level I/O library for Rust focusing on non-blocking APIs and
+event notification for building high performance I/O apps with as little
 overhead as possible over the OS abstractions.
 
 [![Crates.io][crates-badge]][crates-url]
@@ -20,6 +21,7 @@ overhead as possible over the OS abstractions.
 **API documentation**
 
 * [master](https://tokio-rs.github.io/mio/doc/mio/)
+* [v0.7](https://docs.rs/mio/^0.7)
 * [v0.6](https://docs.rs/mio/^0.6)
 
 This is a low level library, if you are looking for something easier to get
@@ -31,13 +33,80 @@ To use `mio`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mio = "0.6"
+mio = "0.7"
 ```
 
-Then, add this to your crate root:
+Next we can start using Mio. The following is quick introduction using
+`TcpListener` and `TcpStream`. Note that `features = ["os-poll", "net"]` must be
+specified for this example.
 
 ```rust
-extern crate mio;
+use std::error::Error;
+
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
+
+// Some tokens to allow us to identify which event is for which socket.
+const SERVER: Token = Token(0);
+const CLIENT: Token = Token(1);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Create a poll instance.
+    let mut poll = Poll::new()?;
+    // Create storage for events.
+    let mut events = Events::with_capacity(128);
+
+    // Setup the server socket.
+    let addr = "127.0.0.1:13265".parse()?;
+    let mut server = TcpListener::bind(addr)?;
+    // Start listening for incoming connections.
+    poll.registry()
+        .register(&mut server, SERVER, Interest::READABLE)?;
+
+    // Setup the client socket.
+    let mut client = TcpStream::connect(addr)?;
+    // Register the socket.
+    poll.registry()
+        .register(&mut client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
+
+    // Start an event loop.
+    loop {
+        // Poll Mio for events, blocking until we get an event.
+        poll.poll(&mut events, None)?;
+
+        // Process each event.
+        for event in events.iter() {
+            // We can use the token we previously provided to `register` to
+            // determine for which socket the event is.
+            match event.token() {
+                SERVER => {
+                    // If this is an event for the server, it means a connection
+                    // is ready to be accepted.
+                    //
+                    // Accept the connection and drop it immediately. This will
+                    // close the socket and notify the client of the EOF.
+                    let connection = server.accept();
+                    drop(connection);
+                }
+                CLIENT => {
+                    if event.is_writable() {
+                        // We can (likely) write to the socket without blocking.
+                    }
+
+                    if event.is_readable() {
+                        // We can (likely) read from the socket without blocking.
+                    }
+
+                    // Since the server just shuts down the connection, let's
+                    // just exit from our event loop.
+                    return Ok(());
+                }
+                // We don't expect any events with tokens other than those we provided.
+                _ => unreachable!(),
+            }
+        }
+    }
+}
 ```
 
 ## Features
@@ -60,8 +129,7 @@ or higher-level libraries.
 
 Currently supported platforms:
 
-* Android
-* Bitrig
+* Android (API level 21)
 * DragonFly BSD
 * FreeBSD
 * Linux
@@ -71,16 +139,33 @@ Currently supported platforms:
 * Windows
 * iOS
 * macOS
+* Wine (version 6.11+, see [issue #1444])
 
 There are potentially others. If you find that Mio works on another
 platform, submit a PR to update the list!
 
+Mio can handle interfacing with each of the event systems of the aforementioned
+platforms. The details of their implementation are further discussed in the
+`Poll` type of the API documentation (see above).
+
+The Windows implementation for polling sockets is using the [wepoll] strategy.
+This uses the Windows AFD system to access socket readiness events.
+
+[wepoll]: https://github.com/piscisaureus/wepoll
+[issue #1444]: https://github.com/tokio-rs/mio/issues/1444
+
+### Unsupported
+
+* Haiku, see [issue #1472]
+
+[issue #1472]: https://github.com/tokio-rs/mio/issues/1472
+
 ## Community
 
-A group of Mio users hang out on [Gitter], this can be a good place to go for
+A group of Mio users hang out on [Discord], this can be a good place to go for
 questions.
 
-[Gitter]: https://gitter.im/tokio-rs/mio
+[Discord]: https://discord.gg/tokio
 
 ## Contributing
 
@@ -89,6 +174,6 @@ bug fixes, just submit a PR with the fix and we can discuss the fix
 directly in the PR. If the fix is more complex, start with an issue.
 
 If you want to propose an API change, create an issue to start a
-discussion with the community. Also, feel free to talk with us in Gitter.
+discussion with the community. Also, feel free to talk with us in Discord.
 
 Finally, be kind. We support the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
