@@ -1,7 +1,12 @@
-use crate::{event, poll, Interests, Registry, Token};
-
 use std::io;
-use std::os::unix::io::RawFd;
+#[cfg(not(target_os = "hermit"))]
+use std::os::fd::RawFd;
+// TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+// can use `std::os::fd` and be merged with the above.
+#[cfg(target_os = "hermit")]
+use std::os::hermit::io::RawFd;
+
+use crate::{event, Interest, Registry, Token};
 
 /// Adapter for [`RawFd`] providing an [`event::Source`] implementation.
 ///
@@ -17,21 +22,31 @@ use std::os::unix::io::RawFd;
 /// that the `SourceFd` is constructed right before a call to
 /// [`Registry::register`]. See the examples for more detail.
 ///
-/// [`event::Source`]: crate::event::Source
-/// [`Poll`]: crate::Poll
-/// [`Registry::register`]: crate::Registry::register
+/// [`event::Source`]: ../event/trait.Source.html
+/// [`Poll`]: ../struct.Poll.html
+/// [`Registry::register`]: ../struct.Registry.html#method.register
 ///
 /// # Examples
 ///
 /// Basic usage.
 ///
-/// ```
+#[cfg_attr(
+    all(feature = "os-poll", feature = "net", feature = "os-ext"),
+    doc = "```"
+)]
+#[cfg_attr(
+    not(all(feature = "os-poll", feature = "net", feature = "os-ext")),
+    doc = "```ignore"
+)]
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
-/// use mio::{Interests, Poll, Token};
+/// use mio::{Interest, Poll, Token};
+/// #[cfg(unix)]
 /// use mio::unix::SourceFd;
+/// #[cfg(target_os = "wasi")]
+/// use mio::wasi::SourceFd;
 ///
-/// use std::os::unix::io::AsRawFd;
+/// use std::os::fd::AsRawFd;
 /// use std::net::TcpListener;
 ///
 /// // Bind a std listener
@@ -41,20 +56,24 @@ use std::os::unix::io::RawFd;
 ///
 /// // Register the listener
 /// poll.registry().register(
-///     &SourceFd(&listener.as_raw_fd()),
+///     &mut SourceFd(&listener.as_raw_fd()),
 ///     Token(0),
-///     Interests::READABLE)?;
+///     Interest::READABLE)?;
 /// #     Ok(())
 /// # }
 /// ```
 ///
 /// Implementing [`event::Source`] for a custom type backed by a [`RawFd`].
 ///
-/// ```
-/// use mio::{event, Interests, Registry, Token};
+#[cfg_attr(all(feature = "os-poll", feature = "os-ext"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "os-ext")), doc = "```ignore")]
+/// use mio::{event, Interest, Registry, Token};
+/// #[cfg(unix)]
 /// use mio::unix::SourceFd;
+/// #[cfg(target_os = "wasi")]
+/// use mio::wasi::SourceFd;
 ///
-/// use std::os::unix::io::RawFd;
+/// use std::os::fd::RawFd;
 /// use std::io;
 ///
 /// # #[allow(dead_code)]
@@ -63,19 +82,19 @@ use std::os::unix::io::RawFd;
 /// }
 ///
 /// impl event::Source for MyIo {
-///     fn register(&self, registry: &Registry, token: Token, interests: Interests)
+///     fn register(&mut self, registry: &Registry, token: Token, interests: Interest)
 ///         -> io::Result<()>
 ///     {
 ///         SourceFd(&self.fd).register(registry, token, interests)
 ///     }
 ///
-///     fn reregister(&self, registry: &Registry, token: Token, interests: Interests)
+///     fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest)
 ///         -> io::Result<()>
 ///     {
 ///         SourceFd(&self.fd).reregister(registry, token, interests)
 ///     }
 ///
-///     fn deregister(&self, registry: &Registry) -> io::Result<()> {
+///     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
 ///         SourceFd(&self.fd).deregister(registry)
 ///     }
 /// }
@@ -84,20 +103,25 @@ use std::os::unix::io::RawFd;
 pub struct SourceFd<'a>(pub &'a RawFd);
 
 impl<'a> event::Source for SourceFd<'a> {
-    fn register(&self, registry: &Registry, token: Token, interests: Interests) -> io::Result<()> {
-        poll::selector(registry).register(*self.0, token, interests)
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        registry.selector().register(*self.0, token, interests)
     }
 
     fn reregister(
-        &self,
+        &mut self,
         registry: &Registry,
         token: Token,
-        interests: Interests,
+        interests: Interest,
     ) -> io::Result<()> {
-        poll::selector(registry).reregister(*self.0, token, interests)
+        registry.selector().reregister(*self.0, token, interests)
     }
 
-    fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        poll::selector(registry).deregister(*self.0)
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        registry.selector().deregister(*self.0)
     }
 }

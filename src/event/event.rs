@@ -9,9 +9,10 @@ use std::fmt;
 ///
 /// For more documentation on polling and events, see [`Poll`].
 ///
-/// [`Poll::poll`]: crate::Poll::poll
-/// [`Poll`]: crate::Poll
-/// [`Token`]: crate::Token
+/// [`Poll::poll`]: ../struct.Poll.html#method.poll
+/// [`Poll`]: ../struct.Poll.html
+/// [`Token`]: ../struct.Token.html
+#[derive(Clone)]
 #[repr(transparent)]
 pub struct Event {
     inner: sys::Event,
@@ -19,19 +20,25 @@ pub struct Event {
 
 impl Event {
     /// Returns the event's token.
-    #[inline]
     pub fn token(&self) -> Token {
         sys::event::token(&self.inner)
     }
 
     /// Returns true if the event contains readable readiness.
-    #[inline]
+    ///
+    /// # Notes
+    ///
+    /// Out-of-band (OOB) data also triggers readable events. But most
+    /// applications don't actually read OOB data, this could leave an
+    /// application open to a Denial-of-Service (Dos) attack, see
+    /// <https://github.com/sandstorm-io/sandstorm-website/blob/58f93346028c0576e8147627667328eaaf4be9fa/_posts/2015-04-08-osx-security-bug.md>.
+    /// However because Mio uses edge-triggers it will not result in an infinite
+    /// loop as described in the article above.
     pub fn is_readable(&self) -> bool {
         sys::event::is_readable(&self.inner)
     }
 
     /// Returns true if the event contains writable readiness.
-    #[inline]
     pub fn is_writable(&self) -> bool {
         sys::event::is_writable(&self.inner)
     }
@@ -55,66 +62,71 @@ impl Event {
     /// | [kqueue]      | `EV_ERROR` and `EV_EOF` with `fflags` set to `0`. |
     ///
     /// [OS selector]: ../struct.Poll.html#implementation-notes
-    /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+    /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
     /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-    #[inline]
     pub fn is_error(&self) -> bool {
         sys::event::is_error(&self.inner)
     }
 
-    /// Returns true if the event contains HUP readiness.
+    /// Returns true if the event contains read closed readiness.
     ///
     /// # Notes
     ///
-    /// Method is available on all platforms, but not all platforms trigger the
-    /// HUP event.
+    /// Read closed readiness can be expected after any of the following have
+    /// occurred:
+    /// * The local stream has shutdown the read half of its socket
+    /// * The local stream has shutdown both the read half and the write half
+    ///   of its socket
+    /// * The peer stream has shutdown the write half its socket; this sends a
+    ///   `FIN` packet that has been received by the local stream
     ///
-    /// Because of the above be cautions when using this in cross-platform
-    /// applications, Mio makes no attempt at normalising this indicator and
-    /// only provides a convenience method to read it. Refer to the selector
-    /// documentation (below) when using this indicator.
+    /// Method is a best effort implementation. While some platforms may not
+    /// return readiness when read half is closed, it is guaranteed that
+    /// false-positives will not occur.
     ///
     /// The table below shows what flags are checked on what OS.
     ///
     /// | [OS selector] | Flag(s) checked |
     /// |---------------|-----------------|
-    /// | [epoll]       | `EPOLLHUP`      |
-    /// | [kqueue]      | Not supported   |
-    ///
-    /// [OS selector]: ../struct.Poll.html#implementation-notes
-    /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
-    /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-    #[inline]
-    pub fn is_hup(&self) -> bool {
-        sys::event::is_hup(&self.inner)
-    }
-
-    /// Returns true if the event contains read HUP readiness.
-    ///
-    /// # Notes
-    ///
-    /// Method is available on all platforms, but not all platforms trigger the
-    /// read HUP event.
-    ///
-    /// Because of the above be cautions when using this in cross-platform
-    /// applications, Mio makes no attempt at normalising this indicator and
-    /// only provides a convenience method to read it. We advice looking at the
-    /// documentation provided for the selectors (see below) when using this
-    /// indicator.
-    ///
-    /// The table below shows what flags are checked on what OS.
-    ///
-    /// | [OS selector] | Flag(s) checked |
-    /// |---------------|-----------------|
-    /// | [epoll]       | `EPOLLRDHUP`    |
+    /// | [epoll]       | `EPOLLHUP`, or  |
+    /// |               | `EPOLLIN` and `EPOLLRDHUP` |
     /// | [kqueue]      | `EV_EOF`        |
     ///
     /// [OS selector]: ../struct.Poll.html#implementation-notes
-    /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+    /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
     /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-    #[inline]
-    pub fn is_read_hup(&self) -> bool {
-        sys::event::is_read_hup(&self.inner)
+    pub fn is_read_closed(&self) -> bool {
+        sys::event::is_read_closed(&self.inner)
+    }
+
+    /// Returns true if the event contains write closed readiness.
+    ///
+    /// # Notes
+    ///
+    /// On [epoll] this is essentially a check for `EPOLLHUP` flag as the
+    /// local stream shutting down its write half does not trigger this event.
+    ///
+    /// On [kqueue] the local stream shutting down the write half of its
+    /// socket will trigger this event.
+    ///
+    /// Method is a best effort implementation. While some platforms may not
+    /// return readiness when write half is closed, it is guaranteed that
+    /// false-positives will not occur.
+    ///
+    /// The table below shows what flags are checked on what OS.
+    ///
+    /// | [OS selector] | Flag(s) checked |
+    /// |---------------|-----------------|
+    /// | [epoll]       | `EPOLLHUP`, or  |
+    /// |               | only `EPOLLERR`, or |
+    /// |               | `EPOLLOUT` and `EPOLLERR` |
+    /// | [kqueue]      | `EV_EOF`        |
+    ///
+    /// [OS selector]: ../struct.Poll.html#implementation-notes
+    /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
+    /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
+    pub fn is_write_closed(&self) -> bool {
+        sys::event::is_write_closed(&self.inner)
     }
 
     /// Returns true if the event contains priority readiness.
@@ -132,7 +144,7 @@ impl Event {
     /// | [kqueue]      | *Not supported* |
     ///
     /// [OS selector]: ../struct.Poll.html#implementation-notes
-    /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+    /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
     /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
     #[inline]
     pub fn is_priority(&self) -> bool {
@@ -155,9 +167,8 @@ impl Event {
     /// 1: Only supported on DragonFly BSD, FreeBSD, iOS and macOS.
     ///
     /// [OS selector]: ../struct.Poll.html#implementation-notes
-    /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+    /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
     /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-    #[inline]
     pub fn is_aio(&self) -> bool {
         sys::event::is_aio(&self.inner)
     }
@@ -168,7 +179,6 @@ impl Event {
     ///
     /// Method is available on all platforms, but only FreeBSD supports LIO. On
     /// FreeBSD this method checks the `EVFILT_LIO` flag.
-    #[inline]
     pub fn is_lio(&self) -> bool {
         sys::event::is_lio(&self.inner)
     }
@@ -183,18 +193,38 @@ impl Event {
     }
 }
 
+/// When the [alternate] flag is enabled this will print platform specific
+/// details, for example the fields of the `kevent` structure on platforms that
+/// use `kqueue(2)`. Note however that the output of this implementation is
+/// **not** consider a part of the stable API.
+///
+/// [alternate]: fmt::Formatter::alternate
 impl fmt::Debug for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Event")
-            .field("token", &self.token())
+        let alternate = f.alternate();
+        let mut d = f.debug_struct("Event");
+        d.field("token", &self.token())
             .field("readable", &self.is_readable())
             .field("writable", &self.is_writable())
             .field("error", &self.is_error())
-            .field("hup", &self.is_hup())
-            .field("read_hup", &self.is_read_hup())
+            .field("read_closed", &self.is_read_closed())
+            .field("write_closed", &self.is_write_closed())
             .field("priority", &self.is_priority())
             .field("aio", &self.is_aio())
-            .field("lio", &self.is_lio())
-            .finish()
+            .field("lio", &self.is_lio());
+
+        if alternate {
+            struct EventDetails<'a>(&'a sys::Event);
+
+            impl fmt::Debug for EventDetails<'_> {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    sys::event::debug_details(f, self.0)
+                }
+            }
+
+            d.field("details", &EventDetails(&self.inner)).finish()
+        } else {
+            d.finish()
+        }
     }
 }

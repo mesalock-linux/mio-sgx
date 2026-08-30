@@ -1,12 +1,29 @@
-use crate::{event, sys, Events, Interests, Token};
-
-use log::trace;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
-#[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(all(
+    unix,
+    not(mio_unsupported_force_poll_poll),
+    not(any(
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "nuttx",
+        target_os = "fuchsia",
+        target_os = "haiku",
+        target_os = "hermit",
+        target_os = "hurd",
+        target_os = "nto",
+        target_os = "vita",
+        target_os = "cygwin",
+        target_os = "horizon"
+    )),
+))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+#[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
+
+use crate::{event, sys, Events, Interest, Token};
 
 /// Polls for readiness events on all registered values.
 ///
@@ -24,38 +41,39 @@ use std::{fmt, io};
 /// event, it will include this token.  This associates the event with the
 /// event source that generated the event.
 ///
-/// [`event::Source`]: crate::event::Source
-/// [`read`]: tcp/struct.TcpStream.html#method.read
-/// [`write`]: tcp/struct.TcpStream.html#method.write
-/// [`register`]: #method.register
+/// [`event::Source`]: ./event/trait.Source.html
+/// [`read`]: ./net/struct.TcpStream.html#method.read
+/// [`write`]: ./net/struct.TcpStream.html#method.write
+/// [`register`]: struct.Registry.html#method.register
 ///
 /// # Examples
 ///
 /// A basic example -- establishing a `TcpStream` connection.
 ///
-/// ```
+#[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
-/// use mio::{Events, Poll, Interests, Token};
+/// use mio::{Events, Poll, Interest, Token};
 /// use mio::net::TcpStream;
 ///
-/// use std::net::{TcpListener, SocketAddr};
+/// use std::net::{self, SocketAddr};
 ///
 /// // Bind a server socket to connect to.
 /// let addr: SocketAddr = "127.0.0.1:0".parse()?;
-/// let server = TcpListener::bind(addr)?;
+/// let server = net::TcpListener::bind(addr)?;
 ///
 /// // Construct a new `Poll` handle as well as the `Events` we'll store into
 /// let mut poll = Poll::new()?;
 /// let mut events = Events::with_capacity(1024);
 ///
 /// // Connect the stream
-/// let stream = TcpStream::connect(server.local_addr()?)?;
+/// let mut stream = TcpStream::connect(server.local_addr()?)?;
 ///
 /// // Register the stream with `Poll`
-/// poll.registry().register(&stream, Token(0), Interests::READABLE | Interests::WRITABLE)?;
+/// poll.registry().register(&mut stream, Token(0), Interest::READABLE | Interest::WRITABLE)?;
 ///
-/// // Wait for the socket to become ready. This has to happens in a loop to
+/// // Wait for the socket to become ready. This has to happen in a loop to
 /// // handle spurious wakeups.
 /// loop {
 ///     poll.poll(&mut events, None)?;
@@ -102,23 +120,24 @@ use std::{fmt, io};
 /// The only readiness operations that are guaranteed to be present on all
 /// supported platforms are [`readable`] and [`writable`]. All other readiness
 /// operations may have false negatives and as such should be considered
-/// **hints**. This means that if a socket is registered with [`readable`],
-/// [`error`], and [`hup`] interest, and either an error or hup is received, a
-/// readiness event will be generated for the socket, but it **may** only
-/// include `readable` readiness. Also note that, given the potential for
-/// spurious events, receiving a readiness event with `hup` or `error` doesn't
-/// actually mean that a `read` on the socket will return a result matching the
-/// readiness event.
+/// **hints**. This means that if a socket is registered with [`readable`]
+/// interest and either an error or close is received, a readiness event will
+/// be generated for the socket, but it **may** only include `readable`
+/// readiness. Also note that, given the potential for spurious events,
+/// receiving a readiness event with `read_closed`, `write_closed`, or `error`
+/// doesn't actually mean that a `read` on the socket will return a result
+/// matching the readiness event.
 ///
-/// In other words, portable programs that explicitly check for [`hup`] or
-/// [`error`] readiness should be doing so as an **optimization** and always be
-/// able to handle an error or HUP situation when performing the actual read
-/// operation.
+/// In other words, portable programs that explicitly check for [`read_closed`],
+/// [`write_closed`], or [`error`] readiness should be doing so as an
+/// **optimization** and always be able to handle an error or close situation
+/// when performing the actual read operation.
 ///
-/// [`readable`]: crate::event::Event::is_readable
-/// [`writable`]: crate::event::Event::is_writable
-/// [`error`]: crate::event::Event::is_error
-/// [`hup`]: crate::event::Event::is_hup
+/// [`readable`]: ./event/struct.Event.html#method.is_readable
+/// [`writable`]: ./event/struct.Event.html#method.is_writable
+/// [`error`]: ./event/struct.Event.html#method.is_error
+/// [`read_closed`]: ./event/struct.Event.html#method.is_read_closed
+/// [`write_closed`]: ./event/struct.Event.html#method.is_write_closed
 ///
 /// ### Registering handles
 ///
@@ -128,18 +147,20 @@ use std::{fmt, io};
 ///
 /// For example:
 ///
-/// ```
+#[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
 /// # use std::error::Error;
 /// # use std::net;
 /// # fn main() -> Result<(), Box<dyn Error>> {
-/// use mio::{Poll, Interests, Token};
+/// use mio::{Poll, Interest, Token};
 /// use mio::net::TcpStream;
+/// use std::net::SocketAddr;
 /// use std::time::Duration;
 /// use std::thread;
 ///
-/// let address = "127.0.0.1:9001".parse()?;
-/// # let _listener = net::TcpListener::bind(address)?;
-/// let sock = TcpStream::connect(address)?;
+/// let address: SocketAddr = "127.0.0.1:0".parse()?;
+/// let listener = net::TcpListener::bind(address)?;
+/// let mut sock = TcpStream::connect(listener.local_addr()?)?;
 ///
 /// thread::sleep(Duration::from_secs(1));
 ///
@@ -147,10 +168,66 @@ use std::{fmt, io};
 ///
 /// // The connect is not guaranteed to have started until it is registered at
 /// // this point
-/// poll.registry().register(&sock, Token(0), Interests::READABLE | Interests::WRITABLE)?;
+/// poll.registry().register(&mut sock, Token(0), Interest::READABLE | Interest::WRITABLE)?;
 /// #     Ok(())
 /// # }
 /// ```
+///
+/// ### Dropping `Poll`
+///
+/// When the `Poll` instance is dropped it may cancel in-flight operations for
+/// the registered [event sources], meaning that no further events for them may
+/// be received. It also means operations on the registered event sources may no
+/// longer work. It is up to the user to keep the `Poll` instance alive while
+/// registered event sources are being used.
+///
+/// [event sources]: ./event/trait.Source.html
+///
+/// ### Accessing raw fd/socket/handle
+///
+/// Mio makes it possible for many types to be converted into a raw file
+/// descriptor (fd, Unix), socket (Windows) or handle (Windows). This makes it
+/// possible to support more operations on the type than Mio supports, for
+/// example it makes [mio-aio] possible. However accessing the raw fd is not
+/// without it's pitfalls.
+///
+/// Specifically performing I/O operations outside of Mio on these types (via
+/// the raw fd) has unspecified behaviour. It could cause no more events to be
+/// generated for the type even though it returned `WouldBlock` (in an operation
+/// directly accessing the fd). The behaviour is OS specific and Mio can only
+/// guarantee cross-platform behaviour if it can control the I/O.
+///
+/// [mio-aio]: https://github.com/asomers/mio-aio
+///
+/// *The following is **not** guaranteed, just a description of the current
+/// situation!* Mio is allowed to change the following without it being considered
+/// a breaking change, don't depend on this, it's just here to inform the user.
+/// Currently the kqueue and epoll implementation support direct I/O operations
+/// on the fd without Mio's knowledge. Windows however needs **all** I/O
+/// operations to go through Mio otherwise it is not able to update it's
+/// internal state properly and won't generate events.
+///
+/// ### Polling without registering event sources
+///
+///
+/// *The following is **not** guaranteed, just a description of the current
+/// situation!* Mio is allowed to change the following without it being
+/// considered a breaking change, don't depend on this, it's just here to inform
+/// the user. On platforms that use epoll, kqueue or IOCP (see implementation
+/// notes below) polling without previously registering [event sources] will
+/// result in sleeping forever, only a process signal will be able to wake up
+/// the thread.
+///
+/// On WASM/WASI this is different as it doesn't support process signals,
+/// furthermore the WASI specification doesn't specify a behaviour in this
+/// situation, thus it's up to the implementation what to do here. As an
+/// example, the wasmtime runtime will return `EINVAL` in this situation, but
+/// different runtimes may return different results. If you have further
+/// insights or thoughts about this situation (and/or how Mio should handle it)
+/// please add you comment to [pull request#1580].
+///
+/// [event sources]: crate::event::Source
+/// [pull request#1580]: https://github.com/tokio-rs/mio/pull/1580
 ///
 /// # Implementation notes
 ///
@@ -159,15 +236,15 @@ use std::{fmt, io};
 /// |      OS       |  Selector |
 /// |---------------|-----------|
 /// | Android       | [epoll]   |
-/// | Bitrig        | [kqueue]  |
 /// | DragonFly BSD | [kqueue]  |
 /// | FreeBSD       | [kqueue]  |
+/// | iOS           | [kqueue]  |
+/// | illumos       | [epoll]   |
 /// | Linux         | [epoll]   |
 /// | NetBSD        | [kqueue]  |
 /// | OpenBSD       | [kqueue]  |
-/// | Solaris       | [epoll]   |
+/// | Solaris       | [event ports] |
 /// | Windows       | [IOCP]    |
-/// | iOS           | [kqueue]  |
 /// | macOS         | [kqueue]  |
 ///
 /// On all supported platforms, socket operations are handled by using the
@@ -184,16 +261,12 @@ use std::{fmt, io};
 /// data to be copied into an intermediate buffer before it is passed to the
 /// kernel.
 ///
-/// Notifications generated by [`SetReadiness`] are handled by an internal
-/// readiness queue. A single call to [`Poll::poll`] will collect events from
-/// both from the system selector and the internal readiness queue.
-///
-/// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+/// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
+/// [event ports]: https://docs.oracle.com/cd/E88353_01/html/E37843/port-create-3c.html
 /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-/// [IOCP]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa365198(v=vs.85).aspx
-/// [`signalfd`]: http://man7.org/linux/man-pages/man2/signalfd.2.html
+/// [IOCP]: https://docs.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports
+/// [`signalfd`]: https://man7.org/linux/man-pages/man2/signalfd.2.html
 /// [`SourceFd`]: unix/struct.SourceFd.html
-/// [`SetReadiness`]: struct.SetReadiness.html
 /// [`Poll::poll`]: struct.Poll.html#method.poll
 pub struct Poll {
     registry: Registry,
@@ -202,62 +275,61 @@ pub struct Poll {
 /// Registers I/O resources.
 pub struct Registry {
     selector: sys::Selector,
+    /// Whether this selector currently has an associated waker.
+    #[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+    has_waker: Arc<AtomicBool>,
 }
-
-/// Used to associate an IO type with a Selector
-#[derive(Debug)]
-#[cfg(debug_assertions)]
-pub struct SelectorId {
-    id: AtomicUsize,
-}
-
-/*
- *
- * ===== Poll =====
- *
- */
 
 impl Poll {
-    /// Return a new `Poll` handle.
-    ///
-    /// This function will make a syscall to the operating system to create the
-    /// system selector. If this syscall fails, `Poll::new` will return with the
-    /// error.
-    ///
-    /// See [struct] level docs for more details.
-    ///
-    /// [struct]: struct.Poll.html
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::error::Error;
-    /// # fn main() -> Result<(), Box<dyn Error>> {
-    /// use mio::{Poll, Events};
-    /// use std::time::Duration;
-    ///
-    /// let mut poll = match Poll::new() {
-    ///     Ok(poll) => poll,
-    ///     Err(e) => panic!("failed to create Poll instance; err={:?}", e),
-    /// };
-    ///
-    /// // Create a structure to receive polled events
-    /// let mut events = Events::with_capacity(1024);
-    ///
-    /// // Wait for events, but none will be received because no
-    /// // `event::Source`s have been registered with this `Poll` instance.
-    /// poll.poll(&mut events, Some(Duration::from_millis(500)))?;
-    /// assert!(events.is_empty());
-    /// #     Ok(())
-    /// # }
-    /// ```
-    pub fn new() -> io::Result<Poll> {
-        sys::Selector::new().map(|selector| Poll {
-            registry: Registry { selector },
-        })
+    cfg_os_poll! {
+        /// Return a new `Poll` handle.
+        ///
+        /// This function will make a syscall to the operating system to create
+        /// the system selector. If this syscall fails, `Poll::new` will return
+        /// with the error.
+        ///
+        /// close-on-exec flag is set on the file descriptors used by the selector to prevent
+        /// leaking it to executed processes.
+        ///
+        /// See [struct] level docs for more details.
+        ///
+        /// [struct]: struct.Poll.html
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// # use std::error::Error;
+        /// # fn main() -> Result<(), Box<dyn Error>> {
+        /// use mio::{Poll, Events};
+        /// use std::time::Duration;
+        ///
+        /// let mut poll = match Poll::new() {
+        ///     Ok(poll) => poll,
+        ///     Err(e) => panic!("failed to create Poll instance; err={:?}", e),
+        /// };
+        ///
+        /// // Create a structure to receive polled events
+        /// let mut events = Events::with_capacity(1024);
+        ///
+        /// // Wait for events, but none will be received because no
+        /// // `event::Source`s have been registered with this `Poll` instance.
+        /// poll.poll(&mut events, Some(Duration::from_millis(500)))?;
+        /// assert!(events.is_empty());
+        /// #     Ok(())
+        /// # }
+        /// ```
+        pub fn new() -> io::Result<Poll> {
+            sys::Selector::new().map(|selector| Poll {
+                registry: Registry {
+                    selector,
+                    #[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+                    has_waker: Arc::new(AtomicBool::new(false)),
+                },
+            })
+        }
     }
 
-    /// Create a separate `Registry` which can be used to register
+    /// Returns a `Registry` which can be used to register
     /// `event::Source`s.
     pub fn registry(&self) -> &Registry {
         &self.registry
@@ -285,23 +357,17 @@ impl Poll {
     ///
     /// Note that the `timeout` will be rounded up to the system clock
     /// granularity (usually 1ms), and kernel scheduling delays mean that
-    /// the blocking interval may be overrun by a small amount.
-    ///
-    /// `poll` returns the number of readiness events that have been pushed into
-    /// `events` or `Err` when an error has been encountered with the system
-    /// selector.  The value returned is deprecated and will be removed in 0.7.0.
-    /// Accessing the events by index is also deprecated.  Events can be
-    /// inserted by other events triggering, thus making sequential access
-    /// problematic.  Use the iterator API instead.  See [`iter`].
+    /// the blocking interval may be overrun by a small amount. A timeout
+    /// of [`Duration::ZERO`] is not affected by this rounding.
     ///
     /// See the [struct] level documentation for a higher level discussion of
     /// polling.
     ///
-    /// [`event::Source`]: crate::event::Source
-    /// [`readable`]: struct.Interests.html#method.readable
-    /// [`writable`]: struct.Interests.html#method.writable
-    /// [struct]: #
-    /// [`iter`]: struct.Events.html#method.iter
+    /// [`event::Source`]: ./event/trait.Source.html
+    /// [`readable`]: struct.Interest.html#associatedconstant.READABLE
+    /// [`writable`]: struct.Interest.html#associatedconstant.WRITABLE
+    /// [struct]: struct.Poll.html
+    /// [`iter`]: ./event/struct.Events.html#method.iter
     ///
     /// # Notes
     ///
@@ -309,14 +375,21 @@ impl Poll {
     /// of Mio would automatically retry the poll call if it was interrupted
     /// (if `EINTR` was returned).
     ///
+    /// Currently if the `timeout` elapses without any readiness events
+    /// triggering this will return `Ok(())`. However we're not guaranteeing
+    /// this behaviour as this depends on the OS.
+    ///
     /// # Examples
     ///
     /// A basic example -- establishing a `TcpStream` connection.
     ///
-    /// ```
+    #[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+    #[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
     /// # use std::error::Error;
     /// # fn main() -> Result<(), Box<dyn Error>> {
-    /// use mio::{Events, Poll, Interests, Token};
+    /// # // WASI does not yet support multithreading:
+    /// # if cfg!(target_os = "wasi") { return Ok(()) }
+    /// use mio::{Events, Poll, Interest, Token};
     /// use mio::net::TcpStream;
     ///
     /// use std::net::{TcpListener, SocketAddr};
@@ -337,15 +410,15 @@ impl Poll {
     /// let mut events = Events::with_capacity(1024);
     ///
     /// // Connect the stream
-    /// let stream = TcpStream::connect(addr)?;
+    /// let mut stream = TcpStream::connect(addr)?;
     ///
     /// // Register the stream with `Poll`
     /// poll.registry().register(
-    ///     &stream,
+    ///     &mut stream,
     ///     Token(0),
-    ///     Interests::READABLE | Interests::WRITABLE)?;
+    ///     Interest::READABLE | Interest::WRITABLE)?;
     ///
-    /// // Wait for the socket to become ready. This has to happens in a loop to
+    /// // Wait for the socket to become ready. This has to happen in a loop to
     /// // handle spurious wakeups.
     /// loop {
     ///     poll.poll(&mut events, None)?;
@@ -367,22 +440,32 @@ impl Poll {
     }
 }
 
+#[cfg(all(
+    unix,
+    not(mio_unsupported_force_poll_poll),
+    not(any(
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "nuttx",
+        target_os = "fuchsia",
+        target_os = "haiku",
+        target_os = "hermit",
+        target_os = "hurd",
+        target_os = "nto",
+        target_os = "vita",
+        target_os = "cygwin",
+        target_os = "horizon"
+    )),
+))]
+impl AsRawFd for Poll {
+    fn as_raw_fd(&self) -> RawFd {
+        self.registry.as_raw_fd()
+    }
+}
+
 impl fmt::Debug for Poll {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Poll").finish()
-    }
-}
-
-impl fmt::Debug for Registry {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("Registry").finish()
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for Poll {
-    fn as_raw_fd(&self) -> RawFd {
-        self.registry.selector.as_raw_fd()
     }
 }
 
@@ -393,26 +476,23 @@ impl Registry {
     /// readiness state changes. When it notices a state change, it will return
     /// a readiness event for the handle the next time [`poll`] is called.
     ///
-    /// See the [`struct`] docs for a high level overview.
+    /// See [`Poll`] docs for a high level overview.
     ///
     /// # Arguments
     ///
-    /// `source: &S: event::Source`: This is the source of events that the
+    /// `source: &mut S: event::Source`: This is the source of events that the
     /// `Poll` instance should monitor for readiness state changes.
     ///
     /// `token: Token`: The caller picks a token to associate with the socket.
     /// When [`poll`] returns an event for the handle, this token is included.
-    /// This allows the caller to map the event to its handle. The token
+    /// This allows the caller to map the event to its source. The token
     /// associated with the `event::Source` can be changed at any time by
     /// calling [`reregister`].
-    ///
-    /// `token` cannot be `Token(usize::MAX)` as it is reserved for internal
-    /// usage.
     ///
     /// See documentation on [`Token`] for an example showing how to pick
     /// [`Token`] values.
     ///
-    /// `interest: Interests`: Specifies which operations `Poll` should monitor
+    /// `interest: Interest`: Specifies which operations `Poll` should monitor
     /// for readiness. `Poll` will only return readiness events for operations
     /// specified by this argument.
     ///
@@ -424,43 +504,46 @@ impl Registry {
     ///
     /// # Notes
     ///
+    /// Callers must ensure that if a source being registered with a `Poll`
+    /// instance was previously registered with that `Poll` instance, then a
+    /// call to [`deregister`] has already occurred. Consecutive calls to
+    /// `register` is unspecified behavior.
+    ///
     /// Unless otherwise specified, the caller should assume that once an event
     /// source is registered with a `Poll` instance, it is bound to that `Poll`
     /// instance for the lifetime of the event source. This remains true even
     /// if the event source is deregistered from the poll instance using
     /// [`deregister`].
     ///
-    /// This function is **thread safe**. It can be called concurrently from
-    /// multiple threads.
-    ///
-    /// [`event::Source`]: crate::event::Source
-    /// [`struct`]: #
-    /// [`reregister`]: #method.reregister
-    /// [`deregister`]: #method.deregister
-    /// [`poll`]: #method.poll
+    /// [`event::Source`]: ./event/trait.Source.html
+    /// [`poll`]: struct.Poll.html#method.poll
+    /// [`reregister`]: struct.Registry.html#method.reregister
+    /// [`deregister`]: struct.Registry.html#method.deregister
     /// [`Token`]: struct.Token.html
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+    #[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
     /// # use std::error::Error;
     /// # use std::net;
     /// # fn main() -> Result<(), Box<dyn Error>> {
-    /// use mio::{Events, Poll, Interests, Token};
+    /// use mio::{Events, Poll, Interest, Token};
     /// use mio::net::TcpStream;
+    /// use std::net::SocketAddr;
     /// use std::time::{Duration, Instant};
     ///
     /// let mut poll = Poll::new()?;
     ///
-    /// let address = "127.0.0.1:9002".parse()?;
-    /// # let _listener = net::TcpListener::bind(address)?;
-    /// let socket = TcpStream::connect(address)?;
+    /// let address: SocketAddr = "127.0.0.1:0".parse()?;
+    /// let listener = net::TcpListener::bind(address)?;
+    /// let mut socket = TcpStream::connect(listener.local_addr()?)?;
     ///
     /// // Register the socket with `poll`
     /// poll.registry().register(
-    ///     &socket,
+    ///     &mut socket,
     ///     Token(0),
-    ///     Interests::READABLE | Interests::WRITABLE)?;
+    ///     Interest::READABLE | Interest::WRITABLE)?;
     ///
     /// let mut events = Events::with_capacity(1024);
     /// let start = Instant::now();
@@ -486,7 +569,7 @@ impl Registry {
     /// }
     /// # }
     /// ```
-    pub fn register<S>(&self, source: &S, token: Token, interests: Interests) -> io::Result<()>
+    pub fn register<S>(&self, source: &mut S, token: Token, interests: Interest) -> io::Result<()>
     where
         S: event::Source + ?Sized,
     {
@@ -510,7 +593,7 @@ impl Registry {
     /// requested for the handle.
     ///
     /// The event source must have previously been registered with this instance
-    /// of `Poll` otherwise the call to `reregister` will return with an error.
+    /// of `Poll`, otherwise the behavior is unspecified.
     ///
     /// See the [`register`] documentation for details about the function
     /// arguments and see the [`struct`] docs for a high level overview of
@@ -518,41 +601,43 @@ impl Registry {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+    #[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
     /// # use std::error::Error;
     /// # use std::net;
     /// # fn main() -> Result<(), Box<dyn Error>> {
-    /// use mio::{Poll, Interests, Token};
+    /// use mio::{Poll, Interest, Token};
     /// use mio::net::TcpStream;
+    /// use std::net::SocketAddr;
     ///
     /// let poll = Poll::new()?;
     ///
-    /// let address = "127.0.0.1:9003".parse()?;
-    /// # let _listener = net::TcpListener::bind(address)?;
-    /// let socket = TcpStream::connect(address)?;
+    /// let address: SocketAddr = "127.0.0.1:0".parse()?;
+    /// let listener = net::TcpListener::bind(address)?;
+    /// let mut socket = TcpStream::connect(listener.local_addr()?)?;
     ///
     /// // Register the socket with `poll`, requesting readable
     /// poll.registry().register(
-    ///     &socket,
+    ///     &mut socket,
     ///     Token(0),
-    ///     Interests::READABLE)?;
+    ///     Interest::READABLE)?;
     ///
     /// // Reregister the socket specifying write interest instead. Even though
     /// // the token is the same it must be specified.
     /// poll.registry().reregister(
-    ///     &socket,
-    ///     Token(2),
-    ///     Interests::WRITABLE)?;
+    ///     &mut socket,
+    ///     Token(0),
+    ///     Interest::WRITABLE)?;
     /// #     Ok(())
     /// # }
     /// ```
     ///
-    /// [`event::Source`]: crate::event::Source
-    /// [`struct`]: #
-    /// [`register`]: #method.register
-    /// [`readable`]: crate::event::Event::is_readable
-    /// [`writable`]: crate::event::Event::is_writable
-    pub fn reregister<S>(&self, source: &S, token: Token, interests: Interests) -> io::Result<()>
+    /// [`event::Source`]: ./event/trait.Source.html
+    /// [`struct`]: struct.Poll.html
+    /// [`register`]: struct.Registry.html#method.register
+    /// [`readable`]: ./event/struct.Event.html#is_readable
+    /// [`writable`]: ./event/struct.Event.html#is_writable
+    pub fn reregister<S>(&self, source: &mut S, token: Token, interests: Interest) -> io::Result<()>
     where
         S: event::Source + ?Sized,
     {
@@ -574,33 +659,38 @@ impl Registry {
     /// as a happens-before relationship is established between this call and
     /// the poll.
     ///
+    /// The event source must have previously been registered with this instance
+    /// of `Poll`, otherwise the behavior is unspecified.
+    ///
     /// A handle can be passed back to `register` after it has been
     /// deregistered; however, it must be passed back to the **same** `Poll`
-    /// instance.
+    /// instance, otherwise the behavior is unspecified.
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
+    #[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
     /// # use std::error::Error;
     /// # use std::net;
     /// # fn main() -> Result<(), Box<dyn Error>> {
-    /// use mio::{Events, Poll, Interests, Token};
+    /// use mio::{Events, Poll, Interest, Token};
     /// use mio::net::TcpStream;
+    /// use std::net::SocketAddr;
     /// use std::time::Duration;
     ///
     /// let mut poll = Poll::new()?;
     ///
-    /// let address = "127.0.0.1:9004".parse()?;
-    /// # let _listener = net::TcpListener::bind(address)?;
-    /// let socket = TcpStream::connect(address)?;
+    /// let address: SocketAddr = "127.0.0.1:0".parse()?;
+    /// let listener = net::TcpListener::bind(address)?;
+    /// let mut socket = TcpStream::connect(listener.local_addr()?)?;
     ///
     /// // Register the socket with `poll`
     /// poll.registry().register(
-    ///     &socket,
+    ///     &mut socket,
     ///     Token(0),
-    ///     Interests::READABLE)?;
+    ///     Interest::READABLE)?;
     ///
-    /// poll.registry().deregister(&socket)?;
+    /// poll.registry().deregister(&mut socket)?;
     ///
     /// let mut events = Events::with_capacity(1024);
     ///
@@ -610,7 +700,7 @@ impl Registry {
     /// #     Ok(())
     /// # }
     /// ```
-    pub fn deregister<S>(&self, source: &S) -> io::Result<()>
+    pub fn deregister<S>(&self, source: &mut S) -> io::Result<()>
     where
         S: event::Source + ?Sized,
     {
@@ -623,53 +713,102 @@ impl Registry {
     /// Event sources registered with this `Registry` will be registered with
     /// the original `Registry` and `Poll` instance.
     pub fn try_clone(&self) -> io::Result<Registry> {
-        self.selector
-            .try_clone()
-            .map(|selector| Registry { selector })
+        self.selector.try_clone().map(|selector| Registry {
+            selector,
+            #[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+            has_waker: Arc::clone(&self.has_waker),
+        })
+    }
+
+    /// Internal check to ensure only a single `Waker` is active per [`Poll`]
+    /// instance.
+    #[cfg(all(debug_assertions, not(any(target_os = "wasi", target_os = "horizon"))))]
+    pub(crate) fn register_waker(&self) {
+        assert!(
+            !self.has_waker.swap(true, Ordering::AcqRel),
+            "Only a single `Waker` can be active per `Poll` instance"
+        );
+    }
+
+    /// Get access to the `sys::Selector`.
+    #[cfg(any(not(target_os = "wasi"), feature = "net"))]
+    #[cfg_attr(target_os = "horizon", allow(dead_code))]
+    pub(crate) fn selector(&self) -> &sys::Selector {
+        &self.selector
     }
 }
 
-// ===== Accessors for internal usage =====
-
-pub fn selector(registry: &Registry) -> &sys::Selector {
-    &registry.selector
-}
-
-#[cfg(debug_assertions)]
-impl SelectorId {
-    pub fn new() -> SelectorId {
-        SelectorId {
-            id: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn associate_selector(&self, registry: &Registry) -> io::Result<()> {
-        let selector_id = self.id.load(Ordering::SeqCst);
-
-        if selector_id != 0 && selector_id != registry.selector.id() {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "socket already registered",
-            ))
-        } else {
-            self.id.store(registry.selector.id(), Ordering::SeqCst);
-            Ok(())
-        }
+impl fmt::Debug for Registry {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("Registry").finish()
     }
 }
 
-#[cfg(debug_assertions)]
-impl Clone for SelectorId {
-    fn clone(&self) -> SelectorId {
-        SelectorId {
-            id: AtomicUsize::new(self.id.load(Ordering::SeqCst)),
-        }
+#[cfg(all(
+    unix,
+    not(mio_unsupported_force_poll_poll),
+    not(any(
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "nuttx",
+        target_os = "haiku",
+        target_os = "fuchsia",
+        target_os = "hermit",
+        target_os = "hurd",
+        target_os = "nto",
+        target_os = "vita",
+        target_os = "cygwin",
+        target_os = "horizon"
+    )),
+))]
+impl AsFd for Registry {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.selector.as_fd()
     }
 }
 
-#[test]
-#[cfg(unix)]
-pub fn as_raw_fd() {
-    let poll = Poll::new().unwrap();
-    assert!(poll.as_raw_fd() > 0);
+#[cfg(all(
+    unix,
+    not(mio_unsupported_force_poll_poll),
+    not(any(
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "nuttx",
+        target_os = "haiku",
+        target_os = "fuchsia",
+        target_os = "hermit",
+        target_os = "hurd",
+        target_os = "nto",
+        target_os = "vita",
+        target_os = "cygwin",
+        target_os = "horizon"
+    )),
+))]
+impl AsRawFd for Registry {
+    fn as_raw_fd(&self) -> RawFd {
+        self.selector.as_raw_fd()
+    }
+}
+
+cfg_os_poll! {
+    #[cfg(all(
+        unix,
+        not(mio_unsupported_force_poll_poll),
+        not(any(
+            target_os = "aix",
+            target_os = "espidf",
+            target_os = "nuttx",
+            target_os = "hermit",
+            target_os = "hurd",
+            target_os = "nto",
+            target_os = "vita",
+            target_os = "cygwin",
+            target_os = "horizon"
+        )),
+    ))]
+    #[test]
+    pub fn as_raw_fd() {
+        let poll = Poll::new().unwrap();
+        assert!(poll.as_raw_fd() > 0);
+    }
 }
